@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   deriveMasterKey,
   deriveSubkeys,
@@ -32,6 +32,9 @@ type OpenState = {
   downloadBlob: Blob | null;
 };
 
+const PRELOAD_STEPS = [5, 10, 15, 20];
+const PRELOAD_STEP_DELAY_MS = 150;
+
 export default function Home() {
   const [passphrase, setPassphrase] = useState("");
   const [status, setStatus] = useState<string>("");
@@ -42,6 +45,7 @@ export default function Home() {
 
   const [open, setOpen] = useState<OpenState | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [visibleCount, setVisibleCount] = useState(0);
 
   function setTileLoading(id: string, loading: boolean) {
     setLoadingIds((prev) => {
@@ -282,6 +286,21 @@ export default function Home() {
     ? Object.values(unlocked.manifest.entries).filter((e) => !e.deleted)
     : [];
 
+  useEffect(() => {
+    if (entries.length === 0) {
+      setVisibleCount(0);
+      return;
+    }
+    const nextStep = PRELOAD_STEPS.find((step) => step > visibleCount);
+    if (nextStep === undefined || visibleCount >= entries.length) return;
+    const timer = setTimeout(() => {
+      setVisibleCount(Math.min(nextStep, entries.length));
+    }, PRELOAD_STEP_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [entries.length, visibleCount]);
+
+  const visibleEntries = entries.slice(0, visibleCount);
+
   return (
     <div className={styles.page}>
       <main className={styles.main}>
@@ -362,7 +381,7 @@ export default function Home() {
               </div>
             ) : (
               <div className={styles.grid}>
-                {entries.map((entry) => {
+                {visibleEntries.map((entry) => {
                   const isHeic = entry.mime_type.includes("heic");
                   const isVideo = entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
                   return (
