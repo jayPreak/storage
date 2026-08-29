@@ -230,10 +230,32 @@ export default function Home() {
     }
   }
 
+  async function loadThumbnailClientSide(entry: ManifestEntry): Promise<Blob> {
+    const accountQs = entry.extra?.pcloud_account
+      ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
+      : "";
+    const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`);
+    if (!res.ok) throw new Error("failed to fetch object");
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const fileKey = await unwrapFileKey(
+      unlocked!.wrapKey,
+      entry.wrap_nonce_hex,
+      entry.wrapped_key_hex,
+      entry.file_id_hex
+    );
+    const { metadata, plaintext } = await decryptPvltObject(buf, fileKey, entry.file_id_hex);
+    const isHeic =
+      metadata.mime_type.includes("heic") || metadata.filename.toLowerCase().endsWith(".heic");
+    const sourceBlob = isHeic
+      ? await convertHeicToJpeg(plaintext)
+      : new Blob([plaintext.buffer as ArrayBuffer], { type: metadata.mime_type });
+    return makeImageThumbnail(sourceBlob);
+  }
+
   async function loadThumbnail(entry: ManifestEntry) {
     if (!unlocked) return;
-    const isImage = entry.mime_type.startsWith("image/") || entry.mime_type.includes("heic");
-    if (!isImage) return;
+    const isVideo = entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
+    const isHeic = entry.mime_type.includes("heic") || entry.filename.toLowerCase().endsWith(".heic");
     if (thumbsRequested.current.has(entry.file_id_hex)) return;
     thumbsRequested.current.add(entry.file_id_hex);
     try {
@@ -243,25 +265,38 @@ export default function Home() {
         return;
       }
 
-      const accountQs = entry.extra?.pcloud_account
-        ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
-        : "";
-      const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`);
-      if (!res.ok) return;
-      const buf = new Uint8Array(await res.arrayBuffer());
-      const fileKey = await unwrapFileKey(
-        unlocked.wrapKey,
-        entry.wrap_nonce_hex,
-        entry.wrapped_key_hex,
-        entry.file_id_hex
-      );
-      const { metadata, plaintext } = await decryptPvltObject(buf, fileKey, entry.file_id_hex);
-      const isHeic =
-        metadata.mime_type.includes("heic") || metadata.filename.toLowerCase().endsWith(".heic");
-      const sourceBlob = isHeic
-        ? await convertHeicToJpeg(plaintext)
-        : new Blob([plaintext.buffer as ArrayBuffer], { type: metadata.mime_type });
-      const thumbBlob = await makeImageThumbnail(sourceBlob);
+      let thumbBlob: Blob;
+      // HEIC can't be decoded server-side here (no libheif in ffmpeg-static
+      // or sharp's build) -- skip straight to the client-side WASM decoder
+      // instead of wasting a round trip that's guaranteed to 422.
+      if (isHeic) {
+        thumbBlob = await loadThumbnailClientSide(entry);
+      } else {
+        try {
+          const fileKey = await unwrapFileKey(
+            unlocked.wrapKey,
+            entry.wrap_nonce_hex,
+            entry.wrapped_key_hex,
+            entry.file_id_hex
+          );
+          const res = await fetch("/api/thumbnail", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              file_id_hex: entry.file_id_hex,
+              file_key_hex: bytesToHex(fileKey),
+              account: entry.extra?.pcloud_account,
+              is_video: isVideo,
+            }),
+          });
+          if (!res.ok) throw new Error("server thumbnail failed");
+          thumbBlob = await res.blob();
+        } catch {
+          if (isVideo) return; // no client-side fallback for video posters
+          thumbBlob = await loadThumbnailClientSide(entry);
+        }
+      }
+
       setThumbs((prev) => ({ ...prev, [entry.file_id_hex]: URL.createObjectURL(thumbBlob) }));
       void putCachedThumb(entry.file_id_hex, thumbBlob);
     } catch {
