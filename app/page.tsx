@@ -32,6 +32,8 @@ type OpenState = {
   mime: string;
   note: string;
   downloadBlob: Blob | null;
+  loading: boolean;
+  placeholderUrl: string | null;
 };
 
 const THUMB_SIZE = 240;
@@ -125,6 +127,28 @@ export default function Home() {
     if (!unlocked) return;
     setError("");
     setTileLoading(entry.file_id_hex, true);
+
+    // Show the lightbox immediately with whatever we already have (the
+    // small cached thumbnail) instead of leaving the user staring at
+    // nothing until the full decrypt/transcode finishes.
+    setOpen({
+      entry,
+      objectUrl: null,
+      mime: entry.mime_type,
+      note: "",
+      downloadBlob: null,
+      loading: true,
+      placeholderUrl: thumbs[entry.file_id_hex] ?? null,
+    });
+
+    // Later updates only apply if this is still the open item -- guards
+    // against a stale async result landing after the user has already
+    // navigated to a different one (e.g. rapid prev/next).
+    const patchOpen = (patch: Partial<OpenState>) =>
+      setOpen((prev) =>
+        prev && prev.entry.file_id_hex === entry.file_id_hex ? { ...prev, ...patch } : prev
+      );
+
     try {
       const accountQs = entry.extra?.pcloud_account
         ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
@@ -160,22 +184,22 @@ export default function Home() {
       if (isHeic) {
         try {
           const jpegBlob = await convertHeicToJpeg(plaintext);
-          setOpen({
-            entry,
+          patchOpen({
             objectUrl: URL.createObjectURL(jpegBlob),
             mime: "image/jpeg",
             note: "Converted from HEIC to JPEG entirely in your browser for preview. Download gets you the original HEIC bytes.",
             downloadBlob: rawBlob,
+            loading: false,
           });
         } catch (decodeErr) {
-          setOpen({
-            entry,
+          patchOpen({
             objectUrl: null,
             mime: metadata.mime_type,
             note: `Decrypted successfully, but this HEIC/HEIF variant couldn't be decoded for preview in-browser: ${
               decodeErr instanceof Error ? decodeErr.message : String(decodeErr)
             }. You can still download the original file.`,
             downloadBlob: rawBlob,
+            loading: false,
           });
         }
       } else if (isMov) {
@@ -199,37 +223,38 @@ export default function Home() {
             mp4Blob = await transcodeRes.blob();
             await putCachedVideo(entry.file_id_hex, mp4Blob);
           }
-          setOpen({
-            entry,
+          patchOpen({
             objectUrl: URL.createObjectURL(mp4Blob),
             mime: "video/mp4",
             note: "Transcoded from HEVC/.mov to H.264 for in-browser playback. Download gets the original file.",
             downloadBlob: rawBlob,
+            loading: false,
           });
         } catch (transcodeErr) {
-          setOpen({
-            entry,
+          patchOpen({
             objectUrl: URL.createObjectURL(rawBlob),
             mime: metadata.mime_type,
             note: `Transcoding failed (${
               transcodeErr instanceof Error ? transcodeErr.message : String(transcodeErr)
             }); some browsers can't play H.264/HEVC .mov via <video> (Safari usually can). If playback fails, download the file instead.`,
             downloadBlob: rawBlob,
+            loading: false,
           });
         }
       } else {
-        setOpen({
-          entry,
+        patchOpen({
           objectUrl: URL.createObjectURL(rawBlob),
           mime: metadata.mime_type,
           note: "",
           downloadBlob: rawBlob,
+          loading: false,
         });
       }
 
       setStatus(`Decrypted ${entry.filename} (${plaintext.length} bytes).`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      patchOpen({ loading: false, note: "Failed to load this file -- see the error above." });
     } finally {
       setTileLoading(entry.file_id_hex, false);
     }
@@ -640,7 +665,24 @@ export default function Home() {
                   ) : (
                     <video src={open.objectUrl} controls autoPlay />
                   ))}
-                {!open.objectUrl && (
+                {!open.objectUrl && open.placeholderUrl && (
+                  // Blown-up cached thumbnail while the full-res decrypt (and
+                  // transcode, for video) is still in flight, instead of a
+                  // blank lightbox -- swaps out for the real media above as
+                  // soon as it's ready.
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={open.placeholderUrl}
+                    alt={open.entry.filename}
+                    className={styles.lightboxPlaceholderImg}
+                  />
+                )}
+                {!open.objectUrl && open.loading && (
+                  <div className={styles.lightboxLoadingOverlay}>
+                    <span className={styles.spinner} />
+                  </div>
+                )}
+                {!open.objectUrl && !open.loading && !open.placeholderUrl && (
                   <div className={styles.lightboxFallback}>
                     <div style={{ fontSize: 48 }}>{"\u{1F5BC}️"}</div>
                     <div>No preview available -- use Download to get the file.</div>

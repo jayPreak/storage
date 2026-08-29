@@ -420,6 +420,30 @@
   padding: 40px;
 }
 
+.lightboxPlaceholderImg {
+  max-width: 100%;
+  max-height: 70vh;
+  border-radius: 8px;
+  /* It's a blown-up 240px thumbnail standing in for the real thing --
+     the blur hides the upscale softness instead of showing it plainly. */
+  filter: blur(6px) brightness(0.85);
+  transform: scale(1.02);
+}
+
+.lightboxLoadingOverlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lightboxLoadingOverlay .spinner {
+  width: 32px;
+  height: 32px;
+  border-width: 3px;
+}
+
 @media (max-width: 600px) {
   .main {
     padding: 20px 12px 60px;
