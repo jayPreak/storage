@@ -42,7 +42,13 @@ export async function GET(
 
     return new NextResponse(upstream.body, {
       status: 200,
-      headers: { "Content-Type": "application/octet-stream" },
+      headers: {
+        "Content-Type": "application/octet-stream",
+        // Ciphertext for a given file id never changes, so it's safe (and
+        // fast) for the browser to cache it indefinitely instead of
+        // re-fetching from pCloud every time a tile/thumbnail is opened.
+        "Cache-Control": "private, max-age=31536000, immutable",
+      },
     });
   } catch {
     return NextResponse.json({ error: "object not found" }, { status: 404 });

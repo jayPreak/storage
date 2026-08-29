@@ -1,16 +1,20 @@
-// Transient preview-only transcode: receives plaintext video bytes that the
-// browser has ALREADY decrypted client-side (this endpoint never sees
-// ciphertext or any vault key), runs them through ffmpeg to produce an
-// H.264/AAC mp4 that all browsers can play, streams the result back, then
-// deletes the temp files. Nothing is persisted -- the original encrypted
-// object on pCloud is untouched; this only serves the in-browser <video>
-// preview for codecs (e.g. HEVC) that most browsers can't decode.
+// Transient preview-only transcode. The browser sends only the per-file
+// key it already unwrapped (small JSON body -- well under Vercel's ~4.5MB
+// serverless request-body cap, unlike sending the whole decrypted video
+// used to). This route fetches the ciphertext itself (like /api/object),
+// decrypts it in memory with that one file key, runs it through ffmpeg to
+// produce H.264/AAC that all browsers can play, streams the result back,
+// then deletes the temp files. Nothing is persisted, and this route never
+// has the wrap key, the master key, or the passphrase -- only ever a
+// single unwrapped file key for the one object it's asked to transcode.
 import { NextResponse } from "next/server";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import ffmpegPath from "ffmpeg-static";
+import { isValidFileIdHex } from "@/lib/vaultPaths";
+import { decryptPvltObject, fetchObjectCiphertext } from "@/lib/pvltServer";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -20,9 +24,19 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "ffmpeg binary not available" }, { status: 500 });
   }
 
-  const buf = Buffer.from(await req.arrayBuffer());
-  if (buf.length === 0) {
-    return NextResponse.json({ error: "empty body" }, { status: 400 });
+  let body: { file_id_hex?: string; file_key_hex?: string; account?: string };
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
+  }
+  const { file_id_hex, file_key_hex, account } = body;
+
+  if (!file_id_hex || !isValidFileIdHex(file_id_hex)) {
+    return NextResponse.json({ error: "invalid file id" }, { status: 400 });
+  }
+  if (!file_key_hex || !/^[0-9a-f]{64}$/i.test(file_key_hex)) {
+    return NextResponse.json({ error: "invalid file key" }, { status: 400 });
   }
 
   const dir = await mkdtemp(path.join(tmpdir(), "vault-transcode-"));
@@ -30,7 +44,11 @@ export async function POST(req: Request) {
   const outPath = path.join(dir, "out.mp4");
 
   try {
-    await writeFile(inPath, buf);
+    const ciphertext = await fetchObjectCiphertext(file_id_hex, account);
+    const fileKey = Buffer.from(file_key_hex, "hex");
+    const { plaintext } = decryptPvltObject(ciphertext, fileKey, file_id_hex);
+
+    await writeFile(inPath, plaintext);
 
     await new Promise<void>((resolve, reject) => {
       const proc = spawn(ffmpegPath as string, [

@@ -32,8 +32,6 @@ type OpenState = {
   downloadBlob: Blob | null;
 };
 
-const PRELOAD_STEPS = [5, 10, 15, 20];
-const PRELOAD_STEP_DELAY_MS = 150;
 const THUMB_SIZE = 240;
 
 async function makeImageThumbnail(blob: Blob): Promise<string> {
@@ -64,7 +62,6 @@ export default function Home() {
 
   const [open, setOpen] = useState<OpenState | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [visibleCount, setVisibleCount] = useState(0);
   const [thumbs, setThumbs] = useState<Record<string, string>>({});
   const thumbsRequested = useRef<Set<string>>(new Set());
 
@@ -185,9 +182,17 @@ export default function Home() {
         try {
           const transcodeRes = await fetch("/api/transcode", {
             method: "POST",
-            body: rawBlob,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              file_id_hex: entry.file_id_hex,
+              file_key_hex: bytesToHex(fileKey),
+              account: entry.extra?.pcloud_account,
+            }),
           });
-          if (!transcodeRes.ok) throw new Error("transcode failed");
+          if (!transcodeRes.ok) {
+            const body = await transcodeRes.json().catch(() => null);
+            throw new Error(body?.error ?? "transcode failed");
+          }
           const mp4Blob = await transcodeRes.blob();
           setOpen({
             entry,
@@ -272,6 +277,15 @@ export default function Home() {
   function closeLightbox() {
     if (open?.objectUrl) URL.revokeObjectURL(open.objectUrl);
     setOpen(null);
+  }
+
+  function openByOffset(offset: number) {
+    if (!open) return;
+    const idx = entries.findIndex((e) => e.file_id_hex === open.entry.file_id_hex);
+    if (idx === -1) return;
+    const nextIdx = idx + offset;
+    if (nextIdx < 0 || nextIdx >= entries.length) return;
+    handleOpen(entries[nextIdx]);
   }
 
   async function handleUpload(files: FileList | null) {
@@ -364,20 +378,9 @@ export default function Home() {
     ? Object.values(unlocked.manifest.entries).filter((e) => !e.deleted)
     : [];
 
-  useEffect(() => {
-    if (entries.length === 0) {
-      setVisibleCount(0);
-      return;
-    }
-    const nextStep = PRELOAD_STEPS.find((step) => step > visibleCount);
-    if (nextStep === undefined || visibleCount >= entries.length) return;
-    const timer = setTimeout(() => {
-      setVisibleCount(Math.min(nextStep, entries.length));
-    }, PRELOAD_STEP_DELAY_MS);
-    return () => clearTimeout(timer);
-  }, [entries.length, visibleCount]);
-
-  const visibleEntries = entries.slice(0, visibleCount);
+  // All entries render immediately -- thumbnails load lazily/async per
+  // tile below, so there's no reason to stagger the tiles themselves.
+  const visibleEntries = entries;
 
   useEffect(() => {
     visibleEntries.forEach((entry) => {
@@ -385,6 +388,33 @@ export default function Home() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visibleEntries.map((e) => e.file_id_hex).join(",")]);
+
+  useEffect(() => {
+    if (!open) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") closeLightbox();
+      else if (e.key === "ArrowLeft") openByOffset(-1);
+      else if (e.key === "ArrowRight") openByOffset(1);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open?.entry.file_id_hex]);
+
+  const touchStartX = useRef<number | null>(null);
+
+  function handleTouchStart(e: React.TouchEvent) {
+    touchStartX.current = e.touches[0].clientX;
+  }
+
+  function handleTouchEnd(e: React.TouchEvent) {
+    if (touchStartX.current === null) return;
+    const dx = e.changedTouches[0].clientX - touchStartX.current;
+    touchStartX.current = null;
+    const SWIPE_THRESHOLD = 50;
+    if (dx > SWIPE_THRESHOLD) openByOffset(-1);
+    else if (dx < -SWIPE_THRESHOLD) openByOffset(1);
+  }
 
   return (
     <div className={styles.page}>
@@ -507,47 +537,82 @@ export default function Home() {
         )}
       </main>
 
-      {open && (
-        <div className={styles.lightboxOverlay} onClick={closeLightbox}>
-          <div className={styles.lightbox} onClick={(e) => e.stopPropagation()}>
-            <div className={styles.lightboxHeader}>
-              <div className={styles.lightboxTitle}>{open.entry.filename}</div>
-              <div className={styles.lightboxActions}>
-                <button
-                  className={styles.btn}
-                  onClick={handleDownload}
-                  disabled={!open.downloadBlob}
-                >
-                  {"↓ Download"}
-                </button>
-                <button className={styles.btn} onClick={closeLightbox}>
-                  Close
-                </button>
+      {open && (() => {
+        const idx = entries.findIndex((e) => e.file_id_hex === open.entry.file_id_hex);
+        const hasPrev = idx > 0;
+        const hasNext = idx !== -1 && idx < entries.length - 1;
+        return (
+          <div className={styles.lightboxOverlay} onClick={closeLightbox}>
+            <div
+              className={styles.lightbox}
+              onClick={(e) => e.stopPropagation()}
+              onTouchStart={handleTouchStart}
+              onTouchEnd={handleTouchEnd}
+            >
+              <div className={styles.lightboxHeader}>
+                <div className={styles.lightboxTitle}>
+                  {open.entry.filename}
+                  {idx !== -1 && (
+                    <span className={styles.lightboxCounter}>
+                      {idx + 1} / {entries.length}
+                    </span>
+                  )}
+                </div>
+                <div className={styles.lightboxActions}>
+                  <button
+                    className={styles.btn}
+                    onClick={handleDownload}
+                    disabled={!open.downloadBlob}
+                  >
+                    {"↓ Download"}
+                  </button>
+                  <button className={styles.btn} onClick={closeLightbox}>
+                    Close
+                  </button>
+                </div>
+              </div>
+              {open.note && <div className={styles.lightboxNote}>{open.note}</div>}
+              <div className={styles.lightboxBody}>
+                {hasPrev && (
+                  <button
+                    className={`${styles.navBtn} ${styles.navBtnLeft}`}
+                    onClick={() => openByOffset(-1)}
+                    aria-label="Previous"
+                  >
+                    {"‹"}
+                  </button>
+                )}
+                {open.objectUrl && open.mime.includes("quicktime") && (
+                  <video src={open.objectUrl} controls autoPlay />
+                )}
+                {open.objectUrl &&
+                  !open.mime.includes("quicktime") &&
+                  (open.mime.startsWith("image/") ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={open.objectUrl} alt={open.entry.filename} />
+                  ) : (
+                    <video src={open.objectUrl} controls autoPlay />
+                  ))}
+                {!open.objectUrl && (
+                  <div className={styles.lightboxFallback}>
+                    <div style={{ fontSize: 48 }}>{"\u{1F5BC}️"}</div>
+                    <div>No preview available -- use Download to get the file.</div>
+                  </div>
+                )}
+                {hasNext && (
+                  <button
+                    className={`${styles.navBtn} ${styles.navBtnRight}`}
+                    onClick={() => openByOffset(1)}
+                    aria-label="Next"
+                  >
+                    {"›"}
+                  </button>
+                )}
               </div>
             </div>
-            {open.note && <div className={styles.lightboxNote}>{open.note}</div>}
-            <div className={styles.lightboxBody}>
-              {open.objectUrl && open.mime.includes("quicktime") && (
-                <video src={open.objectUrl} controls autoPlay />
-              )}
-              {open.objectUrl &&
-                !open.mime.includes("quicktime") &&
-                (open.mime.startsWith("image/") ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={open.objectUrl} alt={open.entry.filename} />
-                ) : (
-                  <video src={open.objectUrl} controls autoPlay />
-                ))}
-              {!open.objectUrl && (
-                <div className={styles.lightboxFallback}>
-                  <div style={{ fontSize: 48 }}>{"\u{1F5BC}️"}</div>
-                  <div>No preview available -- use Download to get the file.</div>
-                </div>
-              )}
-            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 }

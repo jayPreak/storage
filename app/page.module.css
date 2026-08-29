@@ -328,6 +328,17 @@
   font-size: 14px;
   font-weight: 500;
   word-break: break-all;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.lightboxCounter {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.6);
 }
 
 .lightboxActions {
@@ -337,12 +348,14 @@
 }
 
 .lightboxBody {
+  position: relative;
   flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
   min-height: 200px;
   overflow: auto;
+  touch-action: pan-y;
 }
 
 .lightboxBody img,
@@ -350,6 +363,37 @@
   max-width: 100%;
   max-height: 70vh;
   border-radius: 8px;
+}
+
+.navBtn {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: rgba(24, 24, 26, 0.7);
+  color: #fff;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.navBtn:hover {
+  background: rgba(34, 34, 36, 0.85);
+}
+
+.navBtnLeft {
+  left: 4px;
+}
+
+.navBtnRight {
+  right: 4px;
 }
 
 .lightboxNote {
@@ -378,5 +422,45 @@
   .unlockCard {
     margin-top: 8vh;
     padding: 24px;
+  }
+
+  .tile {
+    width: 96px;
+    height: 96px;
+  }
+
+  .topbar {
+    gap: 10px;
+  }
+
+  .brand h1 {
+    font-size: 18px;
+  }
+
+  /* Full-bleed, edge-to-edge lightbox on small screens -- matches the
+     fullscreen photo-viewer pattern used by Google Photos / iCloud Photos. */
+  .lightboxOverlay {
+    padding: 0;
+  }
+
+  .lightbox {
+    max-width: 100%;
+    height: 100%;
+    border-radius: 0;
+  }
+
+  .lightboxHeader {
+    padding: 12px 12px 0;
+  }
+
+  .lightboxBody img,
+  .lightboxBody video {
+    max-height: 60vh;
+  }
+
+  .navBtn {
+    width: 38px;
+    height: 38px;
+    font-size: 18px;
   }
 }
