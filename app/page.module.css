@@ -327,10 +327,16 @@
 .lightboxTitle {
   font-size: 14px;
   font-weight: 500;
-  word-break: break-all;
   display: flex;
   align-items: baseline;
   gap: 8px;
+  min-width: 0;
+}
+
+.lightboxFilename {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   min-width: 0;
 }
 

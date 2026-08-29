@@ -16,6 +16,7 @@ import {
   type ManifestEntry,
 } from "@/lib/vaultCrypto";
 import { convertHeicToJpeg } from "@/lib/heicConvert";
+import { getCachedThumb, putCachedThumb } from "@/lib/thumbCache";
 import styles from "./page.module.css";
 
 type UnlockedState = {
@@ -34,7 +35,7 @@ type OpenState = {
 
 const THUMB_SIZE = 240;
 
-async function makeImageThumbnail(blob: Blob): Promise<string> {
+async function makeImageThumbnail(blob: Blob): Promise<Blob> {
   const bitmap = await createImageBitmap(blob);
   const scale = Math.min(1, THUMB_SIZE / Math.max(bitmap.width, bitmap.height));
   const w = Math.max(1, Math.round(bitmap.width * scale));
@@ -46,10 +47,9 @@ async function makeImageThumbnail(blob: Blob): Promise<string> {
   if (!ctx) throw new Error("no 2d context");
   ctx.drawImage(bitmap, 0, 0, w, h);
   bitmap.close();
-  const thumbBlob: Blob = await new Promise((resolve, reject) =>
+  return new Promise((resolve, reject) =>
     canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("toBlob failed"))), "image/jpeg", 0.75)
   );
-  return URL.createObjectURL(thumbBlob);
 }
 
 export default function Home() {
@@ -237,6 +237,12 @@ export default function Home() {
     if (thumbsRequested.current.has(entry.file_id_hex)) return;
     thumbsRequested.current.add(entry.file_id_hex);
     try {
+      const cached = await getCachedThumb(entry.file_id_hex);
+      if (cached) {
+        setThumbs((prev) => ({ ...prev, [entry.file_id_hex]: URL.createObjectURL(cached) }));
+        return;
+      }
+
       const accountQs = entry.extra?.pcloud_account
         ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
         : "";
@@ -255,8 +261,9 @@ export default function Home() {
       const sourceBlob = isHeic
         ? await convertHeicToJpeg(plaintext)
         : new Blob([plaintext.buffer as ArrayBuffer], { type: metadata.mime_type });
-      const thumbUrl = await makeImageThumbnail(sourceBlob);
-      setThumbs((prev) => ({ ...prev, [entry.file_id_hex]: thumbUrl }));
+      const thumbBlob = await makeImageThumbnail(sourceBlob);
+      setThumbs((prev) => ({ ...prev, [entry.file_id_hex]: URL.createObjectURL(thumbBlob) }));
+      void putCachedThumb(entry.file_id_hex, thumbBlob);
     } catch {
       // Thumbnail is best-effort; leave the icon placeholder on failure.
     }
@@ -551,7 +558,7 @@ export default function Home() {
             >
               <div className={styles.lightboxHeader}>
                 <div className={styles.lightboxTitle}>
-                  {open.entry.filename}
+                  <span className={styles.lightboxFilename}>{open.entry.filename}</span>
                   {idx !== -1 && (
                     <span className={styles.lightboxCounter}>
                       {idx + 1} / {entries.length}
