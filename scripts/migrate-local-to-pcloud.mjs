@@ -22,6 +22,7 @@ const API_BASE = "https://eapi.pcloud.com/";
 const VAULT_DIR = path.resolve(process.cwd(), "vault-data");
 const OBJECTS_DIR = path.join(VAULT_DIR, "objects");
 const MANIFEST_PATH = path.join(VAULT_DIR, "manifest.enc");
+const CONFIG_PATH = path.join(VAULT_DIR, "vault.config.json");
 
 async function pcloudGet(method, params) {
   const qs = new URLSearchParams(params).toString();
@@ -89,12 +90,17 @@ async function main() {
   const manifestBuf = await readFile(MANIFEST_PATH);
   await uploadCiphertext(primary.token, folderid, "manifest.enc", manifestBuf);
 
+  console.log("Uploading vault.config.json...");
+  const configBuf = await readFile(CONFIG_PATH);
+  await uploadCiphertext(primary.token, folderid, "vault.config.json", configBuf);
+
   console.log("Verifying via listfolder...");
   const contents = await listFolder(primary.token, folderid);
   const pvltCount = contents.filter((e) => !e.isfolder && e.name.endsWith(".pvlt")).length;
   const hasManifest = contents.some((e) => !e.isfolder && e.name === "manifest.enc");
+  const hasConfig = contents.some((e) => !e.isfolder && e.name === "vault.config.json");
 
-  console.log(`\nSummary: ${uploaded} objects uploaded, manifest ${hasManifest ? "present" : "MISSING"}.`);
+  console.log(`\nSummary: ${uploaded} objects uploaded, manifest ${hasManifest ? "present" : "MISSING"}, config ${hasConfig ? "present" : "MISSING"}.`);
   console.log(`pCloud vault folder now contains ${pvltCount} .pvlt files (expected ${objectFiles.length}).`);
 }
 
