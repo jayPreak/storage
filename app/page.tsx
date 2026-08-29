@@ -17,6 +17,7 @@ import {
 } from "@/lib/vaultCrypto";
 import { convertHeicToJpeg } from "@/lib/heicConvert";
 import { getCachedThumb, putCachedThumb } from "@/lib/thumbCache";
+import { getCachedVideo, putCachedVideo } from "@/lib/videoCache";
 import styles from "./page.module.css";
 
 type UnlockedState = {
@@ -178,22 +179,26 @@ export default function Home() {
           });
         }
       } else if (isMov) {
-        setStatus(`Transcoding ${entry.filename} for playback...`);
         try {
-          const transcodeRes = await fetch("/api/transcode", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              file_id_hex: entry.file_id_hex,
-              file_key_hex: bytesToHex(fileKey),
-              account: entry.extra?.pcloud_account,
-            }),
-          });
-          if (!transcodeRes.ok) {
-            const body = await transcodeRes.json().catch(() => null);
-            throw new Error(body?.error ?? "transcode failed");
+          let mp4Blob = await getCachedVideo(entry.file_id_hex);
+          if (!mp4Blob) {
+            setStatus(`Transcoding ${entry.filename} for playback...`);
+            const transcodeRes = await fetch("/api/transcode", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                file_id_hex: entry.file_id_hex,
+                file_key_hex: bytesToHex(fileKey),
+                account: entry.extra?.pcloud_account,
+              }),
+            });
+            if (!transcodeRes.ok) {
+              const body = await transcodeRes.json().catch(() => null);
+              throw new Error(body?.error ?? "transcode failed");
+            }
+            mp4Blob = await transcodeRes.blob();
+            await putCachedVideo(entry.file_id_hex, mp4Blob);
           }
-          const mp4Blob = await transcodeRes.blob();
           setOpen({
             entry,
             objectUrl: URL.createObjectURL(mp4Blob),
