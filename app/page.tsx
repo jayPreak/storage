@@ -34,6 +34,25 @@ type OpenState = {
 
 const PRELOAD_STEPS = [5, 10, 15, 20];
 const PRELOAD_STEP_DELAY_MS = 150;
+const THUMB_SIZE = 240;
+
+async function makeImageThumbnail(blob: Blob): Promise<string> {
+  const bitmap = await createImageBitmap(blob);
+  const scale = Math.min(1, THUMB_SIZE / Math.max(bitmap.width, bitmap.height));
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("no 2d context");
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  bitmap.close();
+  const thumbBlob: Blob = await new Promise((resolve, reject) =>
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("toBlob failed"))), "image/jpeg", 0.75)
+  );
+  return URL.createObjectURL(thumbBlob);
+}
 
 export default function Home() {
   const [passphrase, setPassphrase] = useState("");
@@ -46,6 +65,8 @@ export default function Home() {
   const [open, setOpen] = useState<OpenState | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [visibleCount, setVisibleCount] = useState(0);
+  const [thumbs, setThumbs] = useState<Record<string, string>>({});
+  const thumbsRequested = useRef<Set<string>>(new Set());
 
   function setTileLoading(id: string, loading: boolean) {
     setLoadingIds((prev) => {
@@ -159,14 +180,39 @@ export default function Home() {
             downloadBlob: rawBlob,
           });
         }
+      } else if (isMov) {
+        setStatus(`Transcoding ${entry.filename} for playback...`);
+        try {
+          const transcodeRes = await fetch("/api/transcode", {
+            method: "POST",
+            body: rawBlob,
+          });
+          if (!transcodeRes.ok) throw new Error("transcode failed");
+          const mp4Blob = await transcodeRes.blob();
+          setOpen({
+            entry,
+            objectUrl: URL.createObjectURL(mp4Blob),
+            mime: "video/mp4",
+            note: "Transcoded from HEVC/.mov to H.264 for in-browser playback. Download gets the original file.",
+            downloadBlob: rawBlob,
+          });
+        } catch (transcodeErr) {
+          setOpen({
+            entry,
+            objectUrl: URL.createObjectURL(rawBlob),
+            mime: metadata.mime_type,
+            note: `Transcoding failed (${
+              transcodeErr instanceof Error ? transcodeErr.message : String(transcodeErr)
+            }); some browsers can't play H.264/HEVC .mov via <video> (Safari usually can). If playback fails, download the file instead.`,
+            downloadBlob: rawBlob,
+          });
+        }
       } else {
         setOpen({
           entry,
           objectUrl: URL.createObjectURL(rawBlob),
           mime: metadata.mime_type,
-          note: isMov
-            ? "Some browsers can't play H.264/HEVC .mov via <video> (Safari usually can). If playback fails, download the file instead."
-            : "",
+          note: "",
           downloadBlob: rawBlob,
         });
       }
@@ -176,6 +222,38 @@ export default function Home() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setTileLoading(entry.file_id_hex, false);
+    }
+  }
+
+  async function loadThumbnail(entry: ManifestEntry) {
+    if (!unlocked) return;
+    const isImage = entry.mime_type.startsWith("image/") || entry.mime_type.includes("heic");
+    if (!isImage) return;
+    if (thumbsRequested.current.has(entry.file_id_hex)) return;
+    thumbsRequested.current.add(entry.file_id_hex);
+    try {
+      const accountQs = entry.extra?.pcloud_account
+        ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
+        : "";
+      const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`);
+      if (!res.ok) return;
+      const buf = new Uint8Array(await res.arrayBuffer());
+      const fileKey = await unwrapFileKey(
+        unlocked.wrapKey,
+        entry.wrap_nonce_hex,
+        entry.wrapped_key_hex,
+        entry.file_id_hex
+      );
+      const { metadata, plaintext } = await decryptPvltObject(buf, fileKey, entry.file_id_hex);
+      const isHeic =
+        metadata.mime_type.includes("heic") || metadata.filename.toLowerCase().endsWith(".heic");
+      const sourceBlob = isHeic
+        ? await convertHeicToJpeg(plaintext)
+        : new Blob([plaintext.buffer as ArrayBuffer], { type: metadata.mime_type });
+      const thumbUrl = await makeImageThumbnail(sourceBlob);
+      setThumbs((prev) => ({ ...prev, [entry.file_id_hex]: thumbUrl }));
+    } catch {
+      // Thumbnail is best-effort; leave the icon placeholder on failure.
     }
   }
 
@@ -301,6 +379,13 @@ export default function Home() {
 
   const visibleEntries = entries.slice(0, visibleCount);
 
+  useEffect(() => {
+    visibleEntries.forEach((entry) => {
+      void loadThumbnail(entry);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleEntries.map((e) => e.file_id_hex).join(",")]);
+
   return (
     <div className={styles.page}>
       <main className={styles.main}>
@@ -380,21 +465,27 @@ export default function Home() {
                 No items yet. Upload a photo or video to get started.
               </div>
             ) : (
-              <div className={styles.grid}>
+              <div className={styles.filmstrip}>
                 {visibleEntries.map((entry) => {
                   const isHeic = entry.mime_type.includes("heic");
                   const isVideo = entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
+                  const thumbUrl = thumbs[entry.file_id_hex];
                   return (
                     <button
                       key={entry.file_id_hex}
                       className={styles.tile}
                       onClick={() => handleOpen(entry)}
                     >
-                      <div className={styles.tilePlaceholder}>
-                        <div className={styles.tileIcon}>
-                          {isVideo ? "\u{1F3A5}" : "\u{1F5BC}️"}
+                      {thumbUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={thumbUrl} alt={entry.filename} className={styles.thumbImg} />
+                      ) : (
+                        <div className={styles.tilePlaceholder}>
+                          <div className={styles.tileIcon}>
+                            {isVideo ? "\u{1F3A5}" : "\u{1F5BC}️"}
+                          </div>
                         </div>
-                      </div>
+                      )}
                       <div className={styles.tileOverlay}>
                         <div className={styles.tileName}>{entry.filename}</div>
                         <div className={styles.tileMeta}>
