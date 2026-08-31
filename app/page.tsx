@@ -36,7 +36,12 @@ type OpenState = {
   placeholderUrl: string | null;
 };
 
+type Zoom = "S" | "M" | "L" | "XL";
+type View = "library" | "trash";
+type Theme = "dark" | "light";
+
 const THUMB_SIZE = 240;
+const ZOOM_PX: Record<Zoom, number> = { S: 120, M: 168, L: 226, XL: 300 };
 
 async function makeImageThumbnail(blob: Blob): Promise<Blob> {
   const bitmap = await createImageBitmap(blob);
@@ -55,6 +60,25 @@ async function makeImageThumbnail(blob: Blob): Promise<Blob> {
   );
 }
 
+function formatBytes(n: number): string {
+  if (!n || n <= 0) return "0 GB";
+  const gb = n / (1024 * 1024 * 1024);
+  return gb >= 10 ? `${gb.toFixed(0)} GB` : `${gb.toFixed(1)} GB`;
+}
+
+function dateGroupLabel(ts: number): string {
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const startOfDay = (dt: Date) => new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()).getTime();
+  const diffDays = Math.round((startOfDay(now) - startOfDay(d)) / 86400000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  if (d.getFullYear() === now.getFullYear()) {
+    return d.toLocaleDateString(undefined, { month: "long", day: "numeric" });
+  }
+  return d.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
+}
+
 export default function Home() {
   const [passphrase, setPassphrase] = useState("");
   const [status, setStatus] = useState<string>("");
@@ -67,6 +91,53 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [thumbs, setThumbs] = useState<Record<string, string>>({});
   const thumbsRequested = useRef<Set<string>>(new Set());
+
+  // ---- Design-driven UI state ----
+  const [theme, setTheme] = useState<Theme>(() => {
+    if (typeof window === "undefined") return "dark";
+    const saved = window.localStorage.getItem("vault-theme");
+    return saved === "light" ? "light" : "dark";
+  });
+  const [zoom, setZoom] = useState<Zoom>(() => {
+    if (typeof window === "undefined") return "M";
+    const saved = window.localStorage.getItem("vault-zoom");
+    return saved && ["S", "M", "L", "XL"].includes(saved) ? (saved as Zoom) : "M";
+  });
+  const [view, setView] = useState<View>("library");
+  const [search, setSearch] = useState("");
+  const [selectedIds, setSelectedIds] = useState<Record<string, boolean>>({});
+  const [isMobile, setIsMobile] = useState(false);
+  const [storage, setStorage] = useState<{ used: number; quota: number } | null>(null);
+  const [notice, setNotice] = useState<string>("");
+
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth < 860);
+    window.addEventListener("resize", onResize);
+    onResize();
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("vault-theme", theme);
+  }, [theme]);
+  useEffect(() => {
+    window.localStorage.setItem("vault-zoom", zoom);
+  }, [zoom]);
+
+  useEffect(() => {
+    if (!unlocked) return;
+    fetch("/api/storage")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (j && typeof j.quota === "number") setStorage({ used: j.usedquota, quota: j.quota });
+      })
+      .catch(() => {});
+  }, [unlocked]);
+
+  function flashNotice(msg: string) {
+    setNotice(msg);
+    window.setTimeout(() => setNotice((cur) => (cur === msg ? "" : cur)), 2200);
+  }
 
   function setTileLoading(id: string, loading: boolean) {
     setLoadingIds((prev) => {
@@ -121,6 +192,14 @@ export default function Home() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function persistManifest(manifest: Manifest) {
+    if (!unlocked) return;
+    const manifestBlob = await encryptManifest(unlocked.headerKey, manifest);
+    const res = await fetch("/api/manifest", { method: "POST", body: manifestBlob as BodyInit });
+    if (!res.ok) throw new Error("failed to save manifest");
+    setUnlocked((prev) => (prev ? { ...prev, manifest } : prev));
   }
 
   async function handleOpen(entry: ManifestEntry) {
@@ -353,11 +432,11 @@ export default function Home() {
 
   function openByOffset(offset: number) {
     if (!open) return;
-    const idx = entries.findIndex((e) => e.file_id_hex === open.entry.file_id_hex);
+    const idx = visibleEntries.findIndex((e) => e.file_id_hex === open.entry.file_id_hex);
     if (idx === -1) return;
     const nextIdx = idx + offset;
-    if (nextIdx < 0 || nextIdx >= entries.length) return;
-    handleOpen(entries[nextIdx]);
+    if (nextIdx < 0 || nextIdx >= visibleEntries.length) return;
+    handleOpen(visibleEntries[nextIdx]);
   }
 
   async function handleUpload(files: FileList | null) {
@@ -426,14 +505,7 @@ export default function Home() {
         };
 
         setStatus(`Saving manifest for ${file.name}...`);
-        const manifestBlob = await encryptManifest(unlocked.headerKey, manifest);
-        const manifestRes = await fetch("/api/manifest", {
-          method: "POST",
-          body: manifestBlob as BodyInit,
-        });
-        if (!manifestRes.ok) throw new Error("failed to save manifest");
-
-        setUnlocked((prev) => (prev ? { ...prev, manifest } : prev));
+        await persistManifest(manifest);
         setStatus(`Uploaded ${file.name} to ${account}.`);
       }
       setStatus(`Upload complete.`);
@@ -446,20 +518,138 @@ export default function Home() {
     }
   }
 
-  const entries = unlocked
-    ? Object.values(unlocked.manifest.entries).filter((e) => !e.deleted)
-    : [];
+  // ---- Selection ----
+  function toggleSelect(id: string) {
+    setSelectedIds((prev) => {
+      const next = { ...prev };
+      if (next[id]) delete next[id];
+      else next[id] = true;
+      return next;
+    });
+  }
+  function clearSelection() {
+    setSelectedIds({});
+  }
 
-  // All entries render immediately -- thumbnails load lazily/async per
-  // tile below, so there's no reason to stagger the tiles themselves.
-  const visibleEntries = entries;
+  async function decryptEntryToBlob(entry: ManifestEntry): Promise<Blob> {
+    const accountQs = entry.extra?.pcloud_account
+      ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
+      : "";
+    const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`);
+    if (!res.ok) throw new Error("failed to fetch object");
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const fileKey = await unwrapFileKey(
+      unlocked!.wrapKey,
+      entry.wrap_nonce_hex,
+      entry.wrapped_key_hex,
+      entry.file_id_hex
+    );
+    const { metadata, plaintext } = await decryptPvltObject(buf, fileKey, entry.file_id_hex);
+    return new Blob([plaintext.buffer as ArrayBuffer], { type: metadata.mime_type });
+  }
+
+  async function handleBulkDownload() {
+    if (!unlocked) return;
+    const ids = Object.keys(selectedIds);
+    if (ids.length === 0) return;
+    setBusy(true);
+    try {
+      for (const id of ids) {
+        const entry = unlocked.manifest.entries[id];
+        if (!entry) continue;
+        setStatus(`Downloading ${entry.filename}...`);
+        const blob = await decryptEntryToBlob(entry);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = entry.filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      }
+      setStatus(`Downloaded ${ids.length} item(s).`);
+      clearSelection();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleBulkDelete() {
+    if (!unlocked) return;
+    const ids = Object.keys(selectedIds);
+    if (ids.length === 0) return;
+    setBusy(true);
+    setStatus(`Moving ${ids.length} item(s) to trash...`);
+    try {
+      const nextEntries = { ...unlocked.manifest.entries };
+      for (const id of ids) {
+        if (nextEntries[id]) nextEntries[id] = { ...nextEntries[id], deleted: true };
+      }
+      await persistManifest({ ...unlocked.manifest, updated_ts: Date.now() / 1000, entries: nextEntries });
+      setStatus(`Moved ${ids.length} item(s) to trash.`);
+      clearSelection();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRestore(id: string) {
+    if (!unlocked) return;
+    const entry = unlocked.manifest.entries[id];
+    if (!entry) return;
+    const nextEntries = { ...unlocked.manifest.entries, [id]: { ...entry, deleted: false } };
+    await persistManifest({ ...unlocked.manifest, entries: nextEntries });
+  }
+
+  async function handleBulkRestore() {
+    if (!unlocked) return;
+    const ids = Object.keys(selectedIds);
+    if (ids.length === 0) return;
+    const nextEntries = { ...unlocked.manifest.entries };
+    for (const id of ids) {
+      if (nextEntries[id]) nextEntries[id] = { ...nextEntries[id], deleted: false };
+    }
+    await persistManifest({ ...unlocked.manifest, updated_ts: Date.now() / 1000, entries: nextEntries });
+    clearSelection();
+  }
+
+  // Removing the manifest entry only forgets the file locally -- the
+  // encrypted blob stays on pCloud (there's no delete-object API route
+  // yet). Documented in FEATURES.md as a known limitation.
+  async function handleBulkDeletePermanently() {
+    if (!unlocked) return;
+    const ids = Object.keys(selectedIds);
+    if (ids.length === 0) return;
+    if (!window.confirm(`Permanently remove ${ids.length} item(s) from your library? The encrypted files will stay in cloud storage but won't be recoverable from this app.`)) {
+      return;
+    }
+    const nextEntries = { ...unlocked.manifest.entries };
+    for (const id of ids) delete nextEntries[id];
+    await persistManifest({ ...unlocked.manifest, updated_ts: Date.now() / 1000, entries: nextEntries });
+    clearSelection();
+  }
+
+  const allEntries = unlocked ? Object.values(unlocked.manifest.entries) : [];
+  const libraryEntries = allEntries.filter((e) => !e.deleted);
+  const trashEntries = allEntries.filter((e) => e.deleted);
+  const baseEntries = view === "trash" ? trashEntries : libraryEntries;
+  const searchLower = search.trim().toLowerCase();
+  const visibleEntries = (searchLower
+    ? baseEntries.filter((e) => e.filename.toLowerCase().includes(searchLower))
+    : baseEntries
+  ).sort((a, b) => b.added_ts - a.added_ts);
 
   useEffect(() => {
-    visibleEntries.forEach((entry) => {
+    libraryEntries.forEach((entry) => {
       void loadThumbnail(entry);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visibleEntries.map((e) => e.file_id_hex).join(",")]);
+  }, [libraryEntries.map((e) => e.file_id_hex).join(",")]);
 
   useEffect(() => {
     if (!open) return;
@@ -488,10 +678,32 @@ export default function Home() {
     else if (dx < -SWIPE_THRESHOLD) openByOffset(1);
   }
 
+  // Group visible entries by day, preserving desc-sorted order.
+  const dateGroups: { label: string; entries: ManifestEntry[] }[] = [];
+  for (const entry of visibleEntries) {
+    const label = dateGroupLabel(entry.added_ts);
+    const last = dateGroups[dateGroups.length - 1];
+    if (last && last.label === label) last.entries.push(entry);
+    else dateGroups.push({ label, entries: [entry] });
+  }
+
+  const selectedCount = Object.keys(selectedIds).length;
+  const zoomPx = ZOOM_PX[zoom];
+  const gridMinPx = isMobile ? 96 : zoomPx;
+
   return (
-    <div className={styles.page}>
-      <main className={styles.main}>
-        {!unlocked ? (
+    <div
+      className={styles.page}
+      data-theme={theme}
+      onDragOver={(e) => unlocked && e.preventDefault()}
+      onDrop={(e) => {
+        if (!unlocked) return;
+        e.preventDefault();
+        handleUpload(e.dataTransfer.files);
+      }}
+    >
+      {!unlocked ? (
+        <main className={styles.unlockMain}>
           <div className={styles.unlockCard}>
             <h1>Vault</h1>
             <p>
@@ -522,14 +734,155 @@ export default function Home() {
             )}
             {error && <div className={styles.errorBar}>{error}</div>}
           </div>
-        ) : (
-          <div className={styles.shell}>
-            <div className={styles.topbar}>
-              <div className={styles.brand}>
-                <h1>Vault</h1>
-                <span>{entries.length} items</span>
+        </main>
+      ) : (
+        <div className={styles.shell}>
+          {/* ===== Desktop sidebar ===== */}
+          {!isMobile && (
+            <div className={styles.sidebar}>
+              <div className={styles.sidebarBrand}>
+                <span className={styles.lockIcon}>🔒</span>
+                <span className={styles.brandName}>Vault</span>
               </div>
-              <div className={styles.topActions}>
+
+              <div className={styles.searchBox}>
+                <span className={styles.searchIcon}>⌕</span>
+                <input
+                  className={styles.searchInput}
+                  placeholder="Search your library"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+              </div>
+
+              <nav className={styles.navList}>
+                <button
+                  className={`${styles.navItem} ${view === "library" ? styles.navItemActive : ""}`}
+                  onClick={() => setView("library")}
+                >
+                  <span className={styles.navDot} data-active={view === "library"} />
+                  <span>Library</span>
+                </button>
+                <button
+                  className={styles.navItem}
+                  disabled
+                  title="Albums aren't implemented yet -- see FEATURES.md"
+                >
+                  <span className={styles.navDot} />
+                  <span>Albums</span>
+                  <span className={styles.navCount}>12</span>
+                </button>
+                <button
+                  className={`${styles.navItem} ${view === "trash" ? styles.navItemActive : ""}`}
+                  onClick={() => setView("trash")}
+                >
+                  <span className={styles.navDot} data-active={view === "trash"} />
+                  <span>Trash</span>
+                  {trashEntries.length > 0 && (
+                    <span className={styles.navCount}>{trashEntries.length}</span>
+                  )}
+                </button>
+              </nav>
+
+              <div className={styles.foldersSection}>
+                <div className={styles.foldersHeading}>Folders</div>
+                <div
+                  className={styles.folderRow}
+                  title="Folders aren't implemented yet -- see FEATURES.md"
+                  style={{ opacity: 0.45, cursor: "not-allowed" }}
+                >
+                  <span className={styles.folderSwatch} />
+                  <span>Coming soon</span>
+                </div>
+              </div>
+
+              <div style={{ flex: 1 }} />
+
+              <div className={styles.storageCard}>
+                <div className={styles.storageCardTop}>
+                  <span>Vault storage</span>
+                  <span className={styles.mono}>
+                    {storage ? `${formatBytes(storage.used)} / ${formatBytes(storage.quota)}` : "..."}
+                  </span>
+                </div>
+                <div className={styles.meterTrack}>
+                  <div
+                    className={styles.meterFill}
+                    style={{
+                      width: storage && storage.quota > 0
+                        ? `${Math.min(100, (storage.used / storage.quota) * 100)}%`
+                        : "0%",
+                    }}
+                  />
+                </div>
+                <div className={styles.storageCardFoot}>
+                  {storage ? "Across all configured accounts" : "Loading usage..."}
+                </div>
+              </div>
+
+              <div className={styles.userRow}>
+                <div className={styles.avatar} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className={styles.userName}>You</div>
+                  <div className={styles.userSub}>End-to-end encrypted</div>
+                </div>
+                <button
+                  className={styles.themeToggle}
+                  onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+                >
+                  {theme === "dark" ? "Light" : "Dark"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* ===== Mobile header ===== */}
+          {isMobile && (
+            <div className={styles.mobileHeader}>
+              <div className={styles.mobileHeaderLeft}>
+                <span className={styles.lockIcon}>🔒</span>
+                <span className={styles.brandName}>Vault</span>
+              </div>
+              <div className={styles.mobileHeaderRight}>
+                <button
+                  className={styles.iconBtn}
+                  onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+                  aria-label="Toggle theme"
+                >
+                  {theme === "dark" ? "☀" : "☾"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* ===== Main ===== */}
+          <div className={styles.main}>
+            <div className={styles.toolbar}>
+              <div>
+                <div className={styles.title}>{view === "trash" ? "Trash" : "Library"}</div>
+                <div className={styles.subtitle}>
+                  {visibleEntries.length} item{visibleEntries.length === 1 ? "" : "s"} · fully encrypted
+                </div>
+              </div>
+              <div className={styles.toolbarActions}>
+                {selectedCount > 0 && (
+                  <button className={styles.textBtn} onClick={clearSelection}>
+                    Cancel
+                  </button>
+                )}
+                {!isMobile && (
+                  <div className={styles.zoomGroup}>
+                    {(["S", "M", "L", "XL"] as Zoom[]).map((z) => (
+                      <button
+                        key={z}
+                        className={`${styles.zoomBtn} ${zoom === z ? styles.zoomBtnActive : ""}`}
+                        onClick={() => setZoom(z)}
+                      >
+                        {z}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <input
                   ref={fileInputRef}
                   className={styles.fileInput}
@@ -540,79 +893,189 @@ export default function Home() {
                   disabled={busy}
                   onChange={(e) => handleUpload(e.target.files)}
                 />
-                <button
-                  className={`${styles.btn} ${styles.btnPrimary}`}
-                  disabled={busy}
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  {busy ? "Uploading..." : "↑ Upload"}
-                </button>
+                {view === "library" && (
+                  <button
+                    className={`${styles.btn} ${styles.btnPrimary}`}
+                    disabled={busy}
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    {busy ? "Uploading..." : "↑ Upload"}
+                  </button>
+                )}
               </div>
             </div>
 
-            {(status || error) && (
-              <div>
+            {isMobile && (
+              <div className={styles.mobileSearchBox}>
+                <span className={styles.searchIcon}>⌕</span>
+                <input
+                  className={styles.searchInput}
+                  placeholder="Search your library"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+              </div>
+            )}
+
+            {(status || error || notice) && (
+              <div className={styles.statusRow}>
                 {status && !error && (
                   <div className={styles.statusBar}>
                     {busy && <span className={styles.spinner} />}
                     {status}
                   </div>
                 )}
+                {notice && !error && <div className={styles.statusBar}>{notice}</div>}
                 {error && <div className={styles.errorBar}>{error}</div>}
               </div>
             )}
 
-            {entries.length === 0 ? (
+            {visibleEntries.length === 0 ? (
               <div className={styles.emptyState}>
-                No items yet. Upload a photo or video to get started.
+                {view === "trash"
+                  ? "Trash is empty."
+                  : searchLower
+                  ? "No items match your search."
+                  : "No items yet. Upload a photo or video to get started."}
               </div>
             ) : (
-              <div className={styles.filmstrip}>
-                {visibleEntries.map((entry) => {
-                  const isHeic = entry.mime_type.includes("heic");
-                  const isVideo = entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
-                  const thumbUrl = thumbs[entry.file_id_hex];
-                  return (
-                    <button
-                      key={entry.file_id_hex}
-                      className={styles.tile}
-                      onClick={() => handleOpen(entry)}
+              <div className={`${styles.gridScroll} om-scroll`}>
+                {dateGroups.map((group) => (
+                  <div key={group.label} className={styles.dateGroup}>
+                    <div className={styles.dateLabel}>{group.label}</div>
+                    <div
+                      className={styles.grid}
+                      style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${gridMinPx}px, 1fr))` }}
                     >
-                      {thumbUrl ? (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img src={thumbUrl} alt={entry.filename} className={styles.thumbImg} />
-                      ) : (
-                        <div className={styles.tilePlaceholder}>
-                          <div className={styles.tileIcon}>
-                            {isVideo ? "\u{1F3A5}" : "\u{1F5BC}️"}
+                      {group.entries.map((entry) => {
+                        const isHeic = entry.mime_type.includes("heic");
+                        const isVideo =
+                          entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
+                        const thumbUrl = thumbs[entry.file_id_hex];
+                        const selected = !!selectedIds[entry.file_id_hex];
+                        return (
+                          <div
+                            key={entry.file_id_hex}
+                            className={`${styles.tile} ${selected ? styles.tileSelected : ""}`}
+                            onClick={() => handleOpen(entry)}
+                          >
+                            {thumbUrl ? (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img src={thumbUrl} alt={entry.filename} className={styles.thumbImg} />
+                            ) : (
+                              <div className={styles.tilePlaceholder}>
+                                <div className={styles.tileIcon}>{isVideo ? "\u{1F3A5}" : "\u{1F5BC}️"}</div>
+                              </div>
+                            )}
+                            <div className={styles.tileOverlay}>
+                              <div className={styles.tileName}>{entry.filename}</div>
+                              <div className={styles.tileMeta}>
+                                {(entry.size / 1024).toFixed(0)} KiB
+                                {isHeic ? " · HEIC" : ""}
+                              </div>
+                            </div>
+                            <button
+                              className={styles.checkBtn}
+                              data-selected={selected}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleSelect(entry.file_id_hex);
+                              }}
+                              aria-label={selected ? "Deselect" : "Select"}
+                            >
+                              {selected && "✓"}
+                            </button>
+                            <div className={styles.lockBadge}>🔒</div>
+                            {loadingIds.has(entry.file_id_hex) && (
+                              <div className={styles.tileLoading}>
+                                <span className={styles.spinner} />
+                              </div>
+                            )}
                           </div>
-                        </div>
-                      )}
-                      <div className={styles.tileOverlay}>
-                        <div className={styles.tileName}>{entry.filename}</div>
-                        <div className={styles.tileMeta}>
-                          {(entry.size / 1024).toFixed(0)} KiB
-                          {isHeic ? " · HEIC" : ""}
-                        </div>
-                      </div>
-                      {loadingIds.has(entry.file_id_hex) && (
-                        <div className={styles.tileLoading}>
-                          <span className={styles.spinner} />
-                        </div>
-                      )}
-                    </button>
-                  );
-                })}
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>
-        )}
-      </main>
+
+          {/* ===== Mobile bottom tabs ===== */}
+          {isMobile && (
+            <div className={styles.bottomTabs}>
+              <button
+                className={`${styles.bottomTab} ${view === "library" ? styles.bottomTabActive : ""}`}
+                onClick={() => setView("library")}
+              >
+                <span className={styles.navDot} data-active={view === "library"} />
+                Library
+              </button>
+              <button
+                className={styles.bottomTab}
+                disabled
+                title="Folders aren't implemented yet -- see FEATURES.md"
+              >
+                <span className={styles.navDot} />
+                Folders
+              </button>
+              <button
+                className={`${styles.bottomTab} ${view === "trash" ? styles.bottomTabActive : ""}`}
+                onClick={() => setView("trash")}
+              >
+                <span className={styles.navDot} data-active={view === "trash"} />
+                Trash
+              </button>
+            </div>
+          )}
+
+          {/* ===== Floating selection bar ===== */}
+          {selectedCount > 0 && (
+            <div className={styles.selectionBar}>
+              <span className={styles.selectionCount}>{selectedCount} selected</span>
+              <div className={styles.selectionDivider} />
+              {view === "trash" ? (
+                <>
+                  <button className={styles.selectionAction} onClick={handleBulkRestore}>
+                    Restore
+                  </button>
+                  <button className={styles.selectionActionDanger} onClick={handleBulkDeletePermanently}>
+                    Delete permanently
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button className={styles.selectionAction} onClick={handleBulkDownload}>
+                    Download
+                  </button>
+                  <button
+                    className={styles.selectionAction}
+                    style={{ opacity: 0.4, cursor: "not-allowed" }}
+                    onClick={() => flashNotice("Share isn't implemented yet")}
+                  >
+                    Share
+                  </button>
+                  <button
+                    className={styles.selectionAction}
+                    style={{ opacity: 0.4, cursor: "not-allowed" }}
+                    onClick={() => flashNotice("Move isn't implemented yet (no folders yet)")}
+                  >
+                    Move
+                  </button>
+                  <button className={styles.selectionActionDanger} onClick={handleBulkDelete}>
+                    Delete
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {open && (() => {
-        const idx = entries.findIndex((e) => e.file_id_hex === open.entry.file_id_hex);
+        const idx = visibleEntries.findIndex((e) => e.file_id_hex === open.entry.file_id_hex);
         const hasPrev = idx > 0;
-        const hasNext = idx !== -1 && idx < entries.length - 1;
+        const hasNext = idx !== -1 && idx < visibleEntries.length - 1;
         return (
           <div className={styles.lightboxOverlay} onClick={closeLightbox}>
             <div
@@ -626,7 +1089,7 @@ export default function Home() {
                   <span className={styles.lightboxFilename}>{open.entry.filename}</span>
                   {idx !== -1 && (
                     <span className={styles.lightboxCounter}>
-                      {idx + 1} / {entries.length}
+                      {idx + 1} / {visibleEntries.length}
                     </span>
                   )}
                 </div>
@@ -638,6 +1101,14 @@ export default function Home() {
                   >
                     {"↓ Download"}
                   </button>
+                  {view === "trash" ? (
+                    <button
+                      className={styles.btn}
+                      onClick={() => handleRestore(open.entry.file_id_hex)}
+                    >
+                      Restore
+                    </button>
+                  ) : null}
                   <button className={styles.btn} onClick={closeLightbox}>
                     Close
                   </button>
