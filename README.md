@@ -64,3 +64,51 @@ Uploads automatically overflow to the next account in the array once the current
 4. Update the Vercel env var (`vercel env add PCLOUD_ACCOUNTS production` again, or via the dashboard) and update `webapp/.env.local` for local dev.
 
 No code changes are needed -- `pickAccountForUpload` in `lib/pcloudServer.ts` iterates whatever accounts are configured.
+
+## Bulk-importing local photos/videos (`scripts/upload-iphone-pics.mjs`)
+
+For importing a large local folder (e.g. `~/Downloads/iphone pics`) without
+clicking through the browser upload one file at a time. It's a standalone
+Node script that re-implements the exact same pipeline as the app --
+`lib/vaultCrypto.ts`'s Argon2id key derivation + chunked AES-256-GCM `.pvlt`
+encryption, and the same pCloud upload/manifest-update calls as
+`app/api/upload` and `app/api/manifest` -- so anything it uploads shows up
+in the webapp UI exactly as if it had been dragged in there.
+
+Run from `webapp/`:
+
+```bash
+node scripts/upload-iphone-pics.mjs
+```
+
+It prompts for the vault passphrase with hidden terminal input -- the
+passphrase is never passed as a CLI arg, env var, or sent anywhere but into
+the local Argon2id derivation, matching the app's "passphrase never leaves
+this device" guarantee. Don't pipe or script the passphrase into it.
+
+Behavior:
+
+- Reads `PCLOUD_ACCOUNTS` from `.env.local` and fetches the real
+  `vault.config.json` + `manifest.enc` from the primary account's `vault`
+  folder on pCloud (falls back to the bundled `vault-data/` copy if pCloud
+  doesn't have them yet).
+- Walks the watch folder (`~/Downloads/iphone pics` by default) alphabetically,
+  for files with extension `.mov .heic .jpg .jpeg .png .mp4`.
+- Skips any filename already present in the manifest, so it's safe to
+  interrupt and re-run (resumes where it left off).
+- Before each file, checks free quota across configured accounts (same
+  `pickAccountForUpload` logic as the API route) and **stops automatically**
+  once no account has room -- this is the intended way to "fill up" the
+  configured free-tier storage rather than erroring out.
+- Encrypts, uploads, and re-uploads the updated manifest after every
+  successful file, so progress is durable even if the run is interrupted.
+- Logs every action live to `~/vault-upload-results.txt`, and at the end
+  re-fetches the manifest from pCloud to cross-check every uploaded file is
+  actually present there -- the same manifest the webapp reads on unlock.
+- Does **not** compress -- it mirrors `vaultCrypto.ts`, which encrypts only.
+  If compression is added to the app's pipeline, this script needs the same
+  change to stay byte-compatible.
+
+To point it at a different folder, edit `WATCH_DIR` at the top of the
+script (it isn't read from an env var, unlike the Python watcher's
+`VAULT_WATCH_DIR`).
