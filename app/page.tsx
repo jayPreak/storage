@@ -16,6 +16,7 @@ import {
   type ManifestEntry,
 } from "@/lib/vaultCrypto";
 import { convertHeicToJpeg } from "@/lib/heicConvert";
+import { extractCapturedTs } from "@/lib/captureDate";
 import { getCachedThumb, putCachedThumb } from "@/lib/thumbCache";
 import { getCachedVideo, putCachedVideo } from "@/lib/videoCache";
 import styles from "./page.module.css";
@@ -37,8 +38,13 @@ type OpenState = {
 };
 
 type Zoom = "S" | "M" | "L" | "XL";
-type View = "library" | "trash";
+type View = "library" | "trash" | "folders";
 type Theme = "dark" | "light";
+type FolderPath = { year?: number; month?: number; day?: number };
+
+function capturedOf(entry: ManifestEntry): number {
+  return entry.captured_ts ?? entry.added_ts;
+}
 
 const THUMB_SIZE = 240;
 const ZOOM_PX: Record<Zoom, number> = { S: 120, M: 168, L: 226, XL: 300 };
@@ -104,6 +110,7 @@ export default function Home() {
     return saved && ["S", "M", "L", "XL"].includes(saved) ? (saved as Zoom) : "M";
   });
   const [view, setView] = useState<View>("library");
+  const [folderPath, setFolderPath] = useState<FolderPath>({});
   const [search, setSearch] = useState("");
   const [selectedIds, setSelectedIds] = useState<Record<string, boolean>>({});
   const [isMobile, setIsMobile] = useState(false);
@@ -464,6 +471,8 @@ export default function Home() {
             ? "video/quicktime"
             : "application/octet-stream");
 
+        const capturedTs = await extractCapturedTs(plaintext);
+
         setStatus(`Encrypting ${file.name}...`);
         const encrypted = await encryptPvltObject(plaintext, fileKey, fileIdHex, {
           filename: file.name,
@@ -494,6 +503,7 @@ export default function Home() {
           mime_type: mimeType,
           size: plaintext.length,
           added_ts: Date.now() / 1000,
+          ...(capturedTs !== null ? { captured_ts: capturedTs } : {}),
           deleted: false,
           extra: { pcloud_account: account },
         };
@@ -642,7 +652,7 @@ export default function Home() {
   const visibleEntries = (searchLower
     ? baseEntries.filter((e) => e.filename.toLowerCase().includes(searchLower))
     : baseEntries
-  ).sort((a, b) => b.added_ts - a.added_ts);
+  ).sort((a, b) => capturedOf(b) - capturedOf(a));
 
   useEffect(() => {
     libraryEntries.forEach((entry) => {
@@ -681,11 +691,42 @@ export default function Home() {
   // Group visible entries by day, preserving desc-sorted order.
   const dateGroups: { label: string; entries: ManifestEntry[] }[] = [];
   for (const entry of visibleEntries) {
-    const label = dateGroupLabel(entry.added_ts);
+    const label = dateGroupLabel(capturedOf(entry));
     const last = dateGroups[dateGroups.length - 1];
     if (last && last.label === label) last.entries.push(entry);
     else dateGroups.push({ label, entries: [entry] });
   }
+
+  // Folders view: Year -> Month -> Day, computed from capture date.
+  const folderYears = new Map<number, Map<number, Map<number, ManifestEntry[]>>>();
+  if (view === "folders") {
+    for (const entry of libraryEntries) {
+      const d = new Date(capturedOf(entry) * 1000);
+      const y = d.getFullYear();
+      const m = d.getMonth();
+      const day = d.getDate();
+      if (!folderYears.has(y)) folderYears.set(y, new Map());
+      const months = folderYears.get(y)!;
+      if (!months.has(m)) months.set(m, new Map());
+      const days = months.get(m)!;
+      if (!days.has(day)) days.set(day, []);
+      days.get(day)!.push(entry);
+    }
+  }
+  const folderYearsSorted = Array.from(folderYears.keys()).sort((a, b) => b - a);
+  const folderMonths = folderPath.year !== undefined ? folderYears.get(folderPath.year) : undefined;
+  const folderDays =
+    folderPath.year !== undefined && folderPath.month !== undefined
+      ? folderMonths?.get(folderPath.month)
+      : undefined;
+  const folderDayEntries =
+    folderPath.year !== undefined && folderPath.month !== undefined && folderPath.day !== undefined
+      ? (folderDays?.get(folderPath.day) ?? []).sort((a, b) => capturedOf(b) - capturedOf(a))
+      : undefined;
+  const MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+  ];
 
   const selectedCount = Object.keys(selectedIds).length;
   const zoomPx = ZOOM_PX[zoom];
@@ -786,14 +827,16 @@ export default function Home() {
 
               <div className={styles.foldersSection}>
                 <div className={styles.foldersHeading}>Folders</div>
-                <div
+                <button
                   className={styles.folderRow}
-                  title="Folders aren't implemented yet -- see FEATURES.md"
-                  style={{ opacity: 0.45, cursor: "not-allowed" }}
+                  onClick={() => {
+                    setView("folders");
+                    setFolderPath({});
+                  }}
                 >
                   <span className={styles.folderSwatch} />
-                  <span>Coming soon</span>
-                </div>
+                  <span>By date</span>
+                </button>
               </div>
 
               <div style={{ flex: 1 }} />
@@ -859,10 +902,48 @@ export default function Home() {
           <div className={styles.main}>
             <div className={styles.toolbar}>
               <div>
-                <div className={styles.title}>{view === "trash" ? "Trash" : "Library"}</div>
-                <div className={styles.subtitle}>
-                  {visibleEntries.length} item{visibleEntries.length === 1 ? "" : "s"} · fully encrypted
+                <div className={styles.title}>
+                  {view === "trash" ? "Trash" : view === "folders" ? "Folders" : "Library"}
                 </div>
+                {view === "folders" ? (
+                  <div className={styles.folderCrumbs}>
+                    <button className={styles.folderCrumb} onClick={() => setFolderPath({})}>
+                      Folders
+                    </button>
+                    {folderPath.year !== undefined && (
+                      <>
+                        <span className={styles.folderCrumbSep}>/</span>
+                        <button
+                          className={styles.folderCrumb}
+                          onClick={() => setFolderPath({ year: folderPath.year })}
+                        >
+                          {folderPath.year}
+                        </button>
+                      </>
+                    )}
+                    {folderPath.month !== undefined && (
+                      <>
+                        <span className={styles.folderCrumbSep}>/</span>
+                        <button
+                          className={styles.folderCrumb}
+                          onClick={() => setFolderPath({ year: folderPath.year, month: folderPath.month })}
+                        >
+                          {MONTH_NAMES[folderPath.month]}
+                        </button>
+                      </>
+                    )}
+                    {folderPath.day !== undefined && (
+                      <>
+                        <span className={styles.folderCrumbSep}>/</span>
+                        <span>{folderPath.day}</span>
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <div className={styles.subtitle}>
+                    {visibleEntries.length} item{visibleEntries.length === 1 ? "" : "s"} · fully encrypted
+                  </div>
+                )}
               </div>
               <div className={styles.toolbarActions}>
                 {selectedCount > 0 && (
@@ -930,7 +1011,142 @@ export default function Home() {
               </div>
             )}
 
-            {visibleEntries.length === 0 ? (
+            {view === "folders" && folderPath.year === undefined ? (
+              folderYearsSorted.length === 0 ? (
+                <div className={styles.emptyState}>No items yet. Upload a photo or video to get started.</div>
+              ) : (
+                <div className={`${styles.gridScroll} om-scroll`}>
+                  <div className={styles.folderGrid}>
+                    {folderYearsSorted.map((y) => {
+                      const count = Array.from(folderYears.get(y)!.values()).reduce(
+                        (sum, days) => sum + Array.from(days.values()).reduce((s, e) => s + e.length, 0),
+                        0
+                      );
+                      return (
+                        <button
+                          key={y}
+                          className={styles.folderCard}
+                          onClick={() => setFolderPath({ year: y })}
+                        >
+                          <span className={styles.folderCardIcon}>📁</span>
+                          <span className={styles.folderCardLabel}>{y}</span>
+                          <span className={styles.folderCardCount}>
+                            {count} item{count === 1 ? "" : "s"}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )
+            ) : view === "folders" && folderPath.month === undefined ? (
+              <div className={`${styles.gridScroll} om-scroll`}>
+                <div className={styles.folderGrid}>
+                  {MONTH_NAMES.map((name, m) => {
+                    const days = folderMonths?.get(m);
+                    const count = days
+                      ? Array.from(days.values()).reduce((s, e) => s + e.length, 0)
+                      : 0;
+                    return (
+                      <button
+                        key={m}
+                        className={styles.folderCard}
+                        disabled={count === 0}
+                        onClick={() => setFolderPath({ year: folderPath.year, month: m })}
+                      >
+                        <span className={styles.folderCardIcon}>📁</span>
+                        <span className={styles.folderCardLabel}>{name}</span>
+                        <span className={styles.folderCardCount}>
+                          {count} item{count === 1 ? "" : "s"}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : view === "folders" && folderPath.day === undefined ? (
+              <div className={`${styles.gridScroll} om-scroll`}>
+                <div className={styles.folderGrid}>
+                  {Array.from(folderDays?.keys() ?? [])
+                    .sort((a, b) => a - b)
+                    .map((day) => {
+                      const count = folderDays!.get(day)!.length;
+                      return (
+                        <button
+                          key={day}
+                          className={styles.folderCard}
+                          onClick={() => setFolderPath({ year: folderPath.year, month: folderPath.month, day })}
+                        >
+                          <span className={styles.folderCardIcon}>📁</span>
+                          <span className={styles.folderCardLabel}>{day}</span>
+                          <span className={styles.folderCardCount}>
+                            {count} item{count === 1 ? "" : "s"}
+                          </span>
+                        </button>
+                      );
+                    })}
+                </div>
+              </div>
+            ) : view === "folders" ? (
+              (folderDayEntries ?? []).length === 0 ? (
+                <div className={styles.emptyState}>No items on this day.</div>
+              ) : (
+                <div className={`${styles.gridScroll} om-scroll`}>
+                  <div
+                    className={styles.grid}
+                    style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${gridMinPx}px, 1fr))` }}
+                  >
+                    {(folderDayEntries ?? []).map((entry) => {
+                      const isHeic = entry.mime_type.includes("heic");
+                      const isVideo =
+                        entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
+                      const thumbUrl = thumbs[entry.file_id_hex];
+                      const selected = !!selectedIds[entry.file_id_hex];
+                      return (
+                        <div
+                          key={entry.file_id_hex}
+                          className={`${styles.tile} ${selected ? styles.tileSelected : ""}`}
+                          onClick={() => handleOpen(entry)}
+                        >
+                          {thumbUrl ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img src={thumbUrl} alt={entry.filename} className={styles.thumbImg} />
+                          ) : (
+                            <div className={styles.tilePlaceholder}>
+                              <div className={styles.tileIcon}>{isVideo ? "\u{1F3A5}" : "\u{1F5BC}️"}</div>
+                            </div>
+                          )}
+                          <div className={styles.tileOverlay}>
+                            <div className={styles.tileName}>{entry.filename}</div>
+                            <div className={styles.tileMeta}>
+                              {(entry.size / 1024).toFixed(0)} KiB
+                              {isHeic ? " · HEIC" : ""}
+                            </div>
+                          </div>
+                          <button
+                            className={styles.checkBtn}
+                            data-selected={selected}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleSelect(entry.file_id_hex);
+                            }}
+                            aria-label={selected ? "Deselect" : "Select"}
+                          >
+                            {selected && "✓"}
+                          </button>
+                          <div className={styles.lockBadge}>🔒</div>
+                          {loadingIds.has(entry.file_id_hex) && (
+                            <div className={styles.tileLoading}>
+                              <span className={styles.spinner} />
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )
+            ) : visibleEntries.length === 0 ? (
               <div className={styles.emptyState}>
                 {view === "trash"
                   ? "Trash is empty."

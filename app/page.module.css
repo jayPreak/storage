@@ -218,6 +218,15 @@
   border-radius: 8px;
   font-size: 13px;
   color: var(--text-secondary);
+  width: 100%;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.folderRow:hover {
+  background: var(--surface-hover);
 }
 
 .folderSwatch {
@@ -226,6 +235,75 @@
   border-radius: 3px;
   background: var(--surface-hover);
   border: 1px dashed var(--border);
+}
+
+.folderCrumbs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.folderCrumb {
+  border: none;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.folderCrumb:hover {
+  text-decoration: underline;
+}
+
+.folderCrumbSep {
+  color: var(--text-faint);
+}
+
+.folderGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 16px;
+  padding: 4px 0;
+}
+
+.folderCard {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+  color: var(--text-primary);
+}
+
+.folderCard:hover {
+  background: var(--surface-hover);
+}
+
+.folderCard:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.folderCardIcon {
+  font-size: 28px;
+}
+
+.folderCardLabel {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.folderCardCount {
+  font-size: 12px;
+  color: var(--text-faint);
 }
 
 .storageCard {

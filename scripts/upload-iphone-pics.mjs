@@ -120,6 +120,18 @@ async function pickAccountForUpload(accounts, fileSizeBytes) {
 // Crypto (mirrors lib/vaultCrypto.ts, byte-for-byte)
 // ---------------------------------------------------------------------------
 import { argon2id } from "hash-wasm";
+import exifr from "exifr";
+
+async function extractCapturedTs(plaintext) {
+  try {
+    const tags = await exifr.parse(plaintext, { pick: ["DateTimeOriginal", "CreateDate"] });
+    const date = tags?.DateTimeOriginal ?? tags?.CreateDate;
+    if (!date || Number.isNaN(date.getTime())) return null;
+    return date.getTime() / 1000;
+  } catch {
+    return null;
+  }
+}
 
 function hexToBytes(hex) {
   const clean = hex.trim();
@@ -409,6 +421,7 @@ async function main() {
       const fileIdHex = bytesToHex(fileIdBytes);
       const fileKey = randomBytes(32);
       const mimeType = mimeFor(filename);
+      const capturedTs = await extractCapturedTs(plaintext);
 
       const encrypted = await encryptPvltObject(plaintext, fileKey, fileIdHex, {
         filename,
@@ -435,6 +448,7 @@ async function main() {
             mime_type: mimeType,
             size: plaintext.length,
             added_ts: Date.now() / 1000,
+            ...(capturedTs !== null ? { captured_ts: capturedTs } : {}),
             deleted: false,
             extra: { pcloud_account: account.name },
           },

@@ -36,6 +36,7 @@ export interface ManifestEntry {
   mime_type: string;
   size: number;
   added_ts: number;
+  captured_ts?: number; // best-effort EXIF/QuickTime capture date; falls back to added_ts
   deleted: boolean;
   extra?: Record<string, unknown>;
 }
