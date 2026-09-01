@@ -122,7 +122,54 @@ async function pickAccountForUpload(accounts, fileSizeBytes) {
 import { argon2id } from "hash-wasm";
 import exifr from "exifr";
 
+// Seconds between the QuickTime/Mac "creation_time" epoch (1904-01-01) and
+// the Unix epoch (1970-01-01).
+const QT_EPOCH_OFFSET = 2082844800;
+
+// exifr only handles photo formats (JPEG/TIFF/PNG/HEIC) -- no MOV/MP4
+// support. Both containers are ISO-BMFF/QuickTime boxes, so read the
+// `moov` box's `mvhd` sub-box directly for its creation_time field.
+function extractQuickTimeCapturedTs(buf) {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+
+  function findBox(start, end, name) {
+    let offset = start;
+    while (offset + 8 <= end) {
+      let size = view.getUint32(offset);
+      let headerLen = 8;
+      if (size === 1) {
+        if (offset + 16 > end) return null;
+        size = Number(view.getBigUint64(offset + 8));
+        headerLen = 16;
+      } else if (size === 0) {
+        size = end - offset;
+      }
+      const type = String.fromCharCode(buf[offset + 4], buf[offset + 5], buf[offset + 6], buf[offset + 7]);
+      if (type === name) return [offset + headerLen, offset + size];
+      if (size < headerLen || offset + size > end) return null;
+      offset += size;
+    }
+    return null;
+  }
+
+  const moov = findBox(0, buf.length, "moov");
+  if (!moov) return null;
+  const mvhd = findBox(moov[0], moov[1], "mvhd");
+  if (!mvhd) return null;
+
+  const [mvhdStart] = mvhd;
+  const version = buf[mvhdStart];
+  const creationTime = version === 1 ? Number(view.getBigUint64(mvhdStart + 4)) : view.getUint32(mvhdStart + 4);
+  if (!creationTime) return null;
+
+  const unixTs = creationTime - QT_EPOCH_OFFSET;
+  return unixTs > 0 ? unixTs : null;
+}
+
 async function extractCapturedTs(plaintext) {
+  const qtTs = extractQuickTimeCapturedTs(plaintext);
+  if (qtTs !== null) return qtTs;
+
   try {
     const tags = await exifr.parse(plaintext, { pick: ["DateTimeOriginal", "CreateDate"] });
     const date = tags?.DateTimeOriginal ?? tags?.CreateDate;
