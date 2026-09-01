@@ -33,6 +33,10 @@ const RESULTS_PATH = path.resolve(
   process.env.HOME,
   "vault-upload-results.txt"
 );
+const UPLOADED_FILENAMES_PATH = path.resolve(
+  process.env.HOME,
+  "vault-uploaded-filenames.txt"
+);
 
 // ---------------------------------------------------------------------------
 // pCloud REST helpers (mirrors lib/pcloudServer.ts)
@@ -441,6 +445,7 @@ async function main() {
 
       uploaded.push({ filename, size, account: account.name, fileIdHex });
       log(`OK: ${filename} (${size} bytes) -> ${account.name} as ${fileIdHex}.pvlt`);
+      appendFileSync(UPLOADED_FILENAMES_PATH, filename + "\n");
     } catch (e) {
       failed.push(filename);
       log(`FAIL: ${filename} -- ${e.message}`);
