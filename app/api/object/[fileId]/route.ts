@@ -4,7 +4,7 @@
 // All decryption happens client-side.
 import { NextResponse } from "next/server";
 import { isValidFileIdHex } from "@/lib/vaultPaths";
-import { accountByName, findAccountHoldingFile, ensureVaultFolder, getFileidInFolder, getFileLink } from "@/lib/pcloudServer";
+import { accountByName, findAccountHoldingFile, ensureVaultFolder, getFileidInFolder, getFileLink, deleteFile } from "@/lib/pcloudServer";
 
 export async function GET(
   req: Request,
@@ -52,5 +52,44 @@ export async function GET(
     });
   } catch {
     return NextResponse.json({ error: "object not found" }, { status: 404 });
+  }
+}
+
+// Called from "Delete permanently" so the encrypted blob is actually
+// removed from pCloud, not just forgotten from the local manifest.
+export async function DELETE(
+  req: Request,
+  { params }: { params: Promise<{ fileId: string }> }
+) {
+  const { fileId } = await params;
+  const { searchParams } = new URL(req.url);
+  const accountName = searchParams.get("account");
+
+  if (!isValidFileIdHex(fileId)) {
+    return NextResponse.json({ error: "invalid file id" }, { status: 400 });
+  }
+
+  const filename = `${fileId}.pvlt`;
+
+  try {
+    const account = accountName ? accountByName(accountName) : await findAccountHoldingFile(filename);
+    if (!account) {
+      // Nothing to delete -- already gone from cloud storage.
+      return NextResponse.json({ ok: true, alreadyGone: true });
+    }
+
+    const folderid = await ensureVaultFolder(account.token);
+    const fileid = await getFileidInFolder(account.token, folderid, filename);
+    if (fileid === null) {
+      return NextResponse.json({ ok: true, alreadyGone: true });
+    }
+
+    await deleteFile(account.token, fileid);
+    return NextResponse.json({ ok: true });
+  } catch (e) {
+    return NextResponse.json(
+      { error: e instanceof Error ? e.message : "delete failed" },
+      { status: 500 }
+    );
   }
 }

@@ -152,6 +152,10 @@ export async function getFileidInFolder(token: string, folderid: number, filenam
   return found ? found.fileid : null;
 }
 
+export async function deleteFile(token: string, fileid: number): Promise<void> {
+  await pcloudGet("deletefile", { access_token: token, fileid: String(fileid) });
+}
+
 export function accountByName(name: string): PcloudAccount | undefined {
   return loadAccounts().find((a) => a.name === name);
 }

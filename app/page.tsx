@@ -216,6 +216,62 @@ export default function Home() {
     setUnlocked((prev) => (prev ? { ...prev, manifest } : prev));
   }
 
+  // Entries whose object was confirmed 404 get queued here and flushed to
+  // trash in a single manifest write, instead of racing a persistManifest
+  // per tile as thumbnails/opens fail concurrently.
+  const pendingTrashIds = useRef<Set<string>>(new Set());
+  const trashFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  async function flushAutoTrash() {
+    trashFlushTimer.current = null;
+    const ids = Array.from(pendingTrashIds.current);
+    pendingTrashIds.current.clear();
+    if (ids.length === 0 || !unlocked) return;
+    const nextEntries = { ...unlocked.manifest.entries };
+    let changed = false;
+    for (const id of ids) {
+      if (nextEntries[id] && !nextEntries[id].deleted) {
+        nextEntries[id] = { ...nextEntries[id], deleted: true };
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    try {
+      await persistManifest({ ...unlocked.manifest, updated_ts: Date.now() / 1000, entries: nextEntries });
+      setNotice(
+        `Moved ${ids.length} item(s) to trash -- their encrypted files are missing from cloud storage.`
+      );
+    } catch {
+      // Best-effort: whichever entries are still un-trashed will be
+      // re-queued next time they're fetched and 404 again.
+    }
+  }
+
+  function scheduleAutoTrash(id: string) {
+    pendingTrashIds.current.add(id);
+    if (trashFlushTimer.current) clearTimeout(trashFlushTimer.current);
+    trashFlushTimer.current = setTimeout(() => {
+      void flushAutoTrash();
+    }, 800);
+  }
+
+  // Central fetch for the encrypted object bytes. A confirmed 404 means
+  // the .pvlt is gone from cloud storage (deleted outside the app, failed
+  // upload, etc.) -- queue that entry for auto-move-to-trash instead of
+  // leaving a dead reference that keeps getting re-fetched.
+  async function fetchObjectBytes(entry: ManifestEntry): Promise<Uint8Array> {
+    const accountQs = entry.extra?.pcloud_account
+      ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
+      : "";
+    const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`);
+    if (res.status === 404) {
+      scheduleAutoTrash(entry.file_id_hex);
+      throw new Error("object not found in cloud storage -- moved to trash");
+    }
+    if (!res.ok) throw new Error("failed to fetch object");
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
   async function handleOpen(entry: ManifestEntry) {
     if (!unlocked) return;
     setError("");
@@ -243,12 +299,7 @@ export default function Home() {
       );
 
     try {
-      const accountQs = entry.extra?.pcloud_account
-        ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
-        : "";
-      const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`);
-      if (!res.ok) throw new Error("failed to fetch object");
-      const buf = new Uint8Array(await res.arrayBuffer());
+      const buf = await fetchObjectBytes(entry);
 
       const fileKey = await unwrapFileKey(
         unlocked.wrapKey,
@@ -354,12 +405,7 @@ export default function Home() {
   }
 
   async function loadThumbnailClientSide(entry: ManifestEntry): Promise<Blob> {
-    const accountQs = entry.extra?.pcloud_account
-      ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
-      : "";
-    const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`);
-    if (!res.ok) throw new Error("failed to fetch object");
-    const buf = new Uint8Array(await res.arrayBuffer());
+    const buf = await fetchObjectBytes(entry);
     const fileKey = await unwrapFileKey(
       unlocked!.wrapKey,
       entry.wrap_nonce_hex,
@@ -549,12 +595,7 @@ export default function Home() {
   }
 
   async function decryptEntryToBlob(entry: ManifestEntry): Promise<Blob> {
-    const accountQs = entry.extra?.pcloud_account
-      ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
-      : "";
-    const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`);
-    if (!res.ok) throw new Error("failed to fetch object");
-    const buf = new Uint8Array(await res.arrayBuffer());
+    const buf = await fetchObjectBytes(entry);
     const fileKey = await unwrapFileKey(
       unlocked!.wrapKey,
       entry.wrap_nonce_hex,
@@ -635,20 +676,49 @@ export default function Home() {
     clearSelection();
   }
 
-  // Removing the manifest entry only forgets the file locally -- the
-  // encrypted blob stays on pCloud (there's no delete-object API route
-  // yet). Documented in FEATURES.md as a known limitation.
   async function handleBulkDeletePermanently() {
     if (!unlocked) return;
     const ids = Object.keys(selectedIds);
     if (ids.length === 0) return;
-    if (!window.confirm(`Permanently remove ${ids.length} item(s) from your library? The encrypted files will stay in cloud storage but won't be recoverable from this app.`)) {
+    if (
+      !window.confirm(
+        `Permanently delete ${ids.length} item(s)? This also deletes the encrypted files from cloud storage and cannot be undone.`
+      )
+    ) {
       return;
     }
-    const nextEntries = { ...unlocked.manifest.entries };
-    for (const id of ids) delete nextEntries[id];
-    await persistManifest({ ...unlocked.manifest, updated_ts: Date.now() / 1000, entries: nextEntries });
-    clearSelection();
+    setBusy(true);
+    setStatus(`Deleting ${ids.length} item(s) from cloud storage...`);
+    try {
+      const failures: string[] = [];
+      for (const id of ids) {
+        const entry = unlocked.manifest.entries[id];
+        if (!entry) continue;
+        const accountQs = entry.extra?.pcloud_account
+          ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
+          : "";
+        try {
+          const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`, { method: "DELETE" });
+          if (!res.ok) failures.push(entry.filename);
+        } catch {
+          failures.push(entry.filename);
+        }
+      }
+
+      const nextEntries = { ...unlocked.manifest.entries };
+      for (const id of ids) delete nextEntries[id];
+      await persistManifest({ ...unlocked.manifest, updated_ts: Date.now() / 1000, entries: nextEntries });
+      clearSelection();
+      setStatus(
+        failures.length
+          ? `Removed ${ids.length} item(s); cloud delete failed for ${failures.length}: ${failures.join(", ")}.`
+          : `Permanently deleted ${ids.length} item(s) from cloud storage.`
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
   }
 
   const allEntries = unlocked ? Object.values(unlocked.manifest.entries) : [];
