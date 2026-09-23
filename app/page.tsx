@@ -216,17 +216,29 @@ export default function Home() {
     setUnlocked((prev) => (prev ? { ...prev, manifest } : prev));
   }
 
-  // Entries whose object was confirmed 404 get queued here and flushed to
-  // trash in a single manifest write, instead of racing a persistManifest
-  // per tile as thumbnails/opens fail concurrently.
-  const pendingTrashIds = useRef<Set<string>>(new Set());
-  const trashFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Entries whose object came back 404 are only flagged here -- a 404 can
+  // mean the file is genuinely gone, but it can just as easily mean the
+  // pCloud account that holds it dropped out of PCLOUD_ACCOUNTS while the
+  // file is still sitting there untouched. Silently auto-trashing on every
+  // such 404 during ordinary browsing/thumbnailing is too destructive a
+  // default, so this just tracks candidates for the user to review and
+  // move to trash themselves via the "N item(s) missing" banner.
+  const [missingIds, setMissingIds] = useState<Record<string, true>>({});
+  function flagMissing(id: string) {
+    setMissingIds((prev) => (prev[id] ? prev : { ...prev, [id]: true }));
+  }
 
-  async function flushAutoTrash() {
-    trashFlushTimer.current = null;
-    const ids = Array.from(pendingTrashIds.current);
-    pendingTrashIds.current.clear();
-    if (ids.length === 0 || !unlocked) return;
+  async function handleCleanupMissing() {
+    if (!unlocked) return;
+    const ids = Object.keys(missingIds);
+    if (ids.length === 0) return;
+    if (
+      !window.confirm(
+        `Move ${ids.length} item(s) to trash? Their encrypted files couldn't be found under any currently configured cloud storage account -- double-check your account config if this number looks too high before confirming.`
+      )
+    ) {
+      return;
+    }
     const nextEntries = { ...unlocked.manifest.entries };
     let changed = false;
     for (const id of ids) {
@@ -235,38 +247,27 @@ export default function Home() {
         changed = true;
       }
     }
+    setMissingIds({});
     if (!changed) return;
     try {
       await persistManifest({ ...unlocked.manifest, updated_ts: Date.now() / 1000, entries: nextEntries });
-      setNotice(
-        `Moved ${ids.length} item(s) to trash -- their encrypted files are missing from cloud storage.`
-      );
-    } catch {
-      // Best-effort: whichever entries are still un-trashed will be
-      // re-queued next time they're fetched and 404 again.
+      setNotice(`Moved ${ids.length} item(s) to trash.`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
   }
 
-  function scheduleAutoTrash(id: string) {
-    pendingTrashIds.current.add(id);
-    if (trashFlushTimer.current) clearTimeout(trashFlushTimer.current);
-    trashFlushTimer.current = setTimeout(() => {
-      void flushAutoTrash();
-    }, 800);
-  }
-
-  // Central fetch for the encrypted object bytes. A confirmed 404 means
-  // the .pvlt is gone from cloud storage (deleted outside the app, failed
-  // upload, etc.) -- queue that entry for auto-move-to-trash instead of
-  // leaving a dead reference that keeps getting re-fetched.
+  // Central fetch for the encrypted object bytes. A confirmed 404 flags
+  // the entry as a missing-object candidate (see above) instead of
+  // silently trashing it.
   async function fetchObjectBytes(entry: ManifestEntry): Promise<Uint8Array> {
     const accountQs = entry.extra?.pcloud_account
       ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
       : "";
     const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`);
     if (res.status === 404) {
-      scheduleAutoTrash(entry.file_id_hex);
-      throw new Error("object not found in cloud storage -- moved to trash");
+      flagMissing(entry.file_id_hex);
+      throw new Error("object not found in cloud storage");
     }
     if (!res.ok) throw new Error("failed to fetch object");
     return new Uint8Array(await res.arrayBuffer());
@@ -592,6 +593,11 @@ export default function Home() {
   }
   function clearSelection() {
     setSelectedIds({});
+  }
+  function selectAllVisible(entries: ManifestEntry[]) {
+    const next: Record<string, boolean> = {};
+    for (const e of entries) next[e.file_id_hex] = true;
+    setSelectedIds(next);
   }
 
   async function decryptEntryToBlob(entry: ManifestEntry): Promise<Blob> {
@@ -1027,6 +1033,19 @@ export default function Home() {
                 )}
               </div>
               <div className={styles.toolbarActions}>
+                {(() => {
+                  const currentGridEntries = folderDayEntries ?? visibleEntries;
+                  if (currentGridEntries.length === 0) return null;
+                  const allSelected = selectedCount === currentGridEntries.length;
+                  return (
+                    <button
+                      className={styles.textBtn}
+                      onClick={() => (allSelected ? clearSelection() : selectAllVisible(currentGridEntries))}
+                    >
+                      {allSelected ? "Select none" : "Select all"}
+                    </button>
+                  );
+                })()}
                 {selectedCount > 0 && (
                   <button className={styles.textBtn} onClick={clearSelection}>
                     Cancel
@@ -1089,6 +1108,27 @@ export default function Home() {
                 )}
                 {notice && !error && <div className={styles.statusBar}>{notice}</div>}
                 {error && <div className={styles.errorBar}>{error}</div>}
+              </div>
+            )}
+
+            {Object.keys(missingIds).length > 0 && (
+              <div className={styles.statusRow}>
+                <div className={styles.errorBar}>
+                  {Object.keys(missingIds).length} item(s) couldn&apos;t be found under any currently
+                  configured cloud storage account. If this looks like a lot, check your storage account
+                  config before cleaning up -- the files may still exist under an account that dropped out
+                  of config, not actually be deleted.
+                  <button className={styles.textBtn} onClick={handleCleanupMissing} style={{ marginLeft: 8 }}>
+                    Move to trash
+                  </button>
+                  <button
+                    className={styles.textBtn}
+                    onClick={() => setMissingIds({})}
+                    style={{ marginLeft: 4 }}
+                  >
+                    Dismiss
+                  </button>
+                </div>
               </div>
             )}
 
