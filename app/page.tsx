@@ -114,7 +114,7 @@ export default function Home() {
   const [search, setSearch] = useState("");
   const [selectedIds, setSelectedIds] = useState<Record<string, boolean>>({});
   const [isMobile, setIsMobile] = useState(false);
-  const [storage, setStorage] = useState<{ used: number; quota: number } | null>(null);
+  const [storage, setStorage] = useState<{ used: number; quota: number; grandUsed: number; grandQuota: number } | null>(null);
   const [notice, setNotice] = useState<string>("");
 
   useEffect(() => {
@@ -136,7 +136,14 @@ export default function Home() {
     fetch("/api/storage")
       .then((r) => (r.ok ? r.json() : null))
       .then((j) => {
-        if (j && typeof j.quota === "number") setStorage({ used: j.usedquota, quota: j.quota });
+        if (j && typeof j.quota === "number") {
+          setStorage({
+            used: j.usedquota,
+            quota: j.quota,
+            grandUsed: typeof j.grandUsedquota === "number" ? j.grandUsedquota : j.usedquota,
+            grandQuota: typeof j.grandQuota === "number" ? j.grandQuota : j.quota,
+          });
+        }
       })
       .catch(() => {});
   }, [unlocked]);
@@ -859,7 +866,11 @@ export default function Home() {
                   />
                 </div>
                 <div className={styles.storageCardFoot}>
-                  {storage ? "Across all configured accounts" : "Loading usage..."}
+                  {storage
+                    ? storage.grandQuota > storage.quota
+                      ? `${formatBytes(storage.grandUsed)} / ${formatBytes(storage.grandQuota)} combined across all backup storage`
+                      : "Across all configured accounts"
+                    : "Loading usage..."}
                 </div>
               </div>
 

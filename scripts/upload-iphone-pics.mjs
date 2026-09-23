@@ -8,10 +8,11 @@
 // Argon2id derivation) -- matching the app's "passphrase never leaves this
 // device" guarantee.
 import { readFile, readdir, stat } from "node:fs/promises";
-import { readFileSync, appendFileSync, writeFileSync } from "node:fs";
+import { readFileSync, appendFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
+import { spawn, execFileSync } from "node:child_process";
 
 function loadEnvLocal() {
   const envPath = path.resolve(process.cwd(), ".env.local");
@@ -29,9 +30,10 @@ const SAFETY_MARGIN_BYTES = 50 * 1024 * 1024;
 const WATCH_DIR = path.join(os.homedir(), "Downloads", "iphone pics");
 const WATCHED_EXTENSIONS = new Set([".mov", ".heic", ".jpg", ".jpeg", ".png", ".mp4"]);
 const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
+const RUN_TIMESTAMP = new Date().toISOString().replace(/[:.]/g, "-");
 const RESULTS_PATH = path.resolve(
   process.env.HOME,
-  "vault-upload-results.txt"
+  `vault-upload-results-${RUN_TIMESTAMP}.txt`
 );
 const UPLOADED_FILENAMES_PATH = path.resolve(
   process.env.HOME,
@@ -107,13 +109,140 @@ async function pickAccountForUpload(accounts, fileSizeBytes) {
   const errors = [];
   for (const account of accounts) {
     try {
-      const { quota, usedquota } = await getQuota(account.token);
-      if (quota - usedquota >= minFree) return account;
+      const free =
+        account.kind === "rclone"
+          ? await getFreeBytesRclone(account.remote)
+          : await getQuota(account.token).then((q) => q.quota - q.usedquota);
+      if (free >= minFree) return account;
     } catch (e) {
       errors.push(`${account.name}: ${e.message}`);
     }
   }
-  throw new Error(`all pCloud accounts full/unreachable for a ${fileSizeBytes}-byte upload` + (errors.length ? `; ${errors.join("; ")}` : ""));
+  throw new Error(`all storage accounts full/unreachable for a ${fileSizeBytes}-byte upload` + (errors.length ? `; ${errors.join("; ")}` : ""));
+}
+
+// ---------------------------------------------------------------------------
+// rclone-backed account discovery -- covers new pCloud remotes (pulled out
+// of rclone.conf and given full REST treatment, so they're browsable in the
+// webapp gallery same as pcloud1/pcloud2) and any other provider rclone
+// knows how to talk to (MEGA, Drive, OneDrive, ...), which get driven
+// through `rclone about`/`rclone rcat` instead since they have no REST API
+// this script speaks natively.
+// ---------------------------------------------------------------------------
+const ENV_LOCAL_PATH = path.resolve(process.cwd(), ".env.local");
+
+function rcloneConfigPath() {
+  try {
+    const out = execFileSync("rclone", ["config", "file"], { encoding: "utf8" });
+    return out.trim().split("\n").pop().trim();
+  } catch {
+    return null;
+  }
+}
+
+function parseRcloneConfig(text) {
+  const remotes = {};
+  let current = null;
+  for (const line of text.split("\n")) {
+    const section = line.match(/^\[(.+)\]$/);
+    if (section) {
+      current = section[1];
+      remotes[current] = {};
+      continue;
+    }
+    const kv = line.match(/^([\w.-]+)\s*=\s*(.*)$/);
+    if (kv && current) remotes[current][kv[1]] = kv[2];
+  }
+  return remotes;
+}
+
+function loadRcloneRemotes() {
+  const cfgPath = rcloneConfigPath();
+  if (!cfgPath || !existsSync(cfgPath)) return {};
+  return parseRcloneConfig(readFileSync(cfgPath, "utf8"));
+}
+
+function extractPcloudTokenFromRcloneEntry(entry) {
+  if (!entry.token) return null;
+  try {
+    return JSON.parse(entry.token).access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Adds any newly-configured `rclone config` pcloud remote to PCLOUD_ACCOUNTS
+// (and persists it to .env.local) so the webapp picks it up automatically,
+// without hand-editing a token in again.
+async function syncNewPcloudAccountsFromRclone(accounts, remotes) {
+  const known = new Set(accounts.map((a) => a.name));
+  let added = false;
+  for (const [name, entry] of Object.entries(remotes)) {
+    if (entry.type !== "pcloud" || known.has(name)) continue;
+    const token = extractPcloudTokenFromRcloneEntry(entry);
+    if (!token) continue;
+    try {
+      await getQuota(token);
+    } catch (e) {
+      log(`SKIP new rclone pcloud remote ${name}: token check failed -- ${e.message}`);
+      continue;
+    }
+    accounts.push({ name, token });
+    known.add(name);
+    added = true;
+    log(`Discovered new pCloud account from rclone config: ${name}`);
+  }
+  if (added && existsSync(ENV_LOCAL_PATH)) {
+    const text = readFileSync(ENV_LOCAL_PATH, "utf8");
+    const lines = text.split("\n");
+    const idx = lines.findIndex((l) => l.startsWith("PCLOUD_ACCOUNTS="));
+    const serialized = `PCLOUD_ACCOUNTS=${JSON.stringify(accounts)}`;
+    if (idx >= 0) lines[idx] = serialized;
+    else lines.push(serialized);
+    writeFileSync(ENV_LOCAL_PATH, lines.join("\n"));
+    log(`Updated .env.local PCLOUD_ACCOUNTS (${accounts.length} accounts) so the webapp picks them up too.`);
+  }
+  return accounts;
+}
+
+// Every other rclone remote (mega1, gdrive1, onedrive1, ...) becomes a
+// generic backend account: not browsable from the webapp gallery yet, just
+// extra backup capacity the vault can spill into once pCloud is full.
+function otherRcloneAccounts(pcloudAccountNames, remotes) {
+  return Object.keys(remotes)
+    .filter((name) => !pcloudAccountNames.has(name))
+    .map((name) => ({ name, kind: "rclone", remote: `${name}:` }));
+}
+
+function runRclone(args, input) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("rclone", args, { stdio: [input ? "pipe" : "ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`rclone ${args.join(" ")} failed: ${stderr.trim() || `exit ${code}`}`));
+    });
+    if (input) {
+      child.stdin.write(input);
+      child.stdin.end();
+    }
+  });
+}
+
+async function getFreeBytesRclone(remote) {
+  const out = await runRclone(["about", remote, "--json"]);
+  const info = JSON.parse(out);
+  if (typeof info.free === "number") return info.free;
+  if (typeof info.total === "number" && typeof info.used === "number") return info.total - info.used;
+  throw new Error(`rclone about ${remote} returned no usable free/total figures`);
+}
+
+async function uploadCiphertextRclone(remote, filename, buffer) {
+  await runRclone(["rcat", `${remote}vault/${filename}`], buffer);
 }
 
 // ---------------------------------------------------------------------------
@@ -359,13 +488,16 @@ function log(line) {
 // main
 // ---------------------------------------------------------------------------
 async function main() {
-  const accounts = JSON.parse(process.env.PCLOUD_ACCOUNTS);
+  let accounts = JSON.parse(process.env.PCLOUD_ACCOUNTS);
   const primary = accounts[0];
 
-  writeFileSync(
-    RESULTS_PATH,
-    `Vault upload run started ${new Date().toISOString()}\nSource: ${WATCH_DIR}\nAccounts: ${accounts.map((a) => a.name).join(", ")}\n\n`
-  );
+  writeFileSync(RESULTS_PATH, `Vault upload run started ${new Date().toISOString()}\nSource: ${WATCH_DIR}\n\n`);
+
+  console.log("Checking rclone config for new/other storage accounts...");
+  const rcloneRemotes = loadRcloneRemotes();
+  accounts = await syncNewPcloudAccountsFromRclone(accounts, rcloneRemotes);
+  const allAccounts = [...accounts, ...otherRcloneAccounts(new Set(accounts.map((a) => a.name)), rcloneRemotes)];
+  log(`Accounts: ${allAccounts.map((a) => a.name + (a.kind === "rclone" ? " (rclone)" : "")).join(", ")}`);
 
   console.log("Fetching vault config + manifest from pCloud...");
   const folderid = await ensureVaultFolder(primary.token);
@@ -454,7 +586,7 @@ async function main() {
 
     let account;
     try {
-      account = await pickAccountForUpload(accounts, size);
+      account = await pickAccountForUpload(allAccounts, size);
     } catch (e) {
       log(`STOP: no account has room for ${filename} (${size} bytes) -- ${e.message}`);
       stoppedForQuota = true;
@@ -478,8 +610,12 @@ async function main() {
 
       const { wrap_nonce_hex, wrapped_key_hex } = await wrapFileKey(wrapKey, fileIdHex, fileKey);
 
-      const accFolderid = account.name === primary.name ? folderid : await ensureVaultFolder(account.token);
-      await uploadCiphertext(account.token, accFolderid, `${fileIdHex}.pvlt`, encrypted);
+      if (account.kind === "rclone") {
+        await uploadCiphertextRclone(account.remote, `${fileIdHex}.pvlt`, encrypted);
+      } else {
+        const accFolderid = account.name === primary.name ? folderid : await ensureVaultFolder(account.token);
+        await uploadCiphertext(account.token, accFolderid, `${fileIdHex}.pvlt`, encrypted);
+      }
 
       manifest = {
         ...manifest,
@@ -497,7 +633,10 @@ async function main() {
             added_ts: Date.now() / 1000,
             ...(capturedTs !== null ? { captured_ts: capturedTs } : {}),
             deleted: false,
-            extra: { pcloud_account: account.name },
+            extra:
+              account.kind === "rclone"
+                ? { backend: "rclone", backend_account: account.name }
+                : { pcloud_account: account.name },
           },
         },
       };
@@ -529,6 +668,27 @@ async function main() {
     }
   }
   log(`Verified ${verifiedCount}/${uploaded.length} uploaded entries present in the re-fetched pCloud manifest (this is exactly what the webapp UI reads on unlock).`);
+
+  log("\n--- Writing combined storage summary (all accounts, incl. non-pCloud) ---");
+  const storageSummary = { updated_ts: Date.now() / 1000, accounts: [] };
+  for (const account of allAccounts) {
+    try {
+      if (account.kind === "rclone") {
+        const out = await runRclone(["about", account.remote, "--json"]);
+        const info = JSON.parse(out);
+        const quota = info.total ?? null;
+        const usedquota = info.used ?? (quota !== null && typeof info.free === "number" ? quota - info.free : null);
+        storageSummary.accounts.push({ name: account.name, backend: "rclone", quota, usedquota });
+      } else {
+        const q = await getQuota(account.token);
+        storageSummary.accounts.push({ name: account.name, backend: "pcloud", quota: q.quota, usedquota: q.usedquota });
+      }
+    } catch (e) {
+      log(`  (couldn't fetch usage for ${account.name}: ${e.message})`);
+    }
+  }
+  await uploadCiphertext(primary.token, folderid, "storage-summary.json", Buffer.from(JSON.stringify(storageSummary)));
+  log(`Storage summary written for ${storageSummary.accounts.length}/${allAccounts.length} accounts -- the webapp reads this for the combined total.`);
 
   log("\n=== SUMMARY ===");
   log(`Uploaded: ${uploaded.length}`);
