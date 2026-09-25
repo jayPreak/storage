@@ -156,6 +156,55 @@ export async function deleteFile(token: string, fileid: number): Promise<void> {
   await pcloudGet("deletefile", { access_token: token, fileid: String(fileid) });
 }
 
+// ---- Path-addressed helpers (used for stored thumbnails) ----
+// Thumbnails live in their own folder and are looked up by exact path, so
+// reading one is a single getfilelink call instead of listing the whole
+// (1000+ entry) vault folder like the original-object lookup does.
+
+const PCLOUD_NOT_FOUND = new Set([2002, 2005, 2009]); // component/dir/file missing
+
+export async function getFileLinkByPath(token: string, filePath: string): Promise<string | null> {
+  const qs = new URLSearchParams({ access_token: token, path: filePath }).toString();
+  const res = await fetch(`${API_BASE}getfilelink?${qs}`);
+  const json = (await res.json()) as { result: number; hosts?: string[]; path?: string };
+  if (PCLOUD_NOT_FOUND.has(json.result)) return null;
+  if (json.result !== 0 || !json.hosts?.length) {
+    throw new Error(`pCloud getfilelink failed: result=${json.result}`);
+  }
+  return `https://${json.hosts[0]}${json.path}`;
+}
+
+export async function uploadToPath(
+  token: string,
+  folderPath: string,
+  filename: string,
+  bytes: Uint8Array
+): Promise<void> {
+  await pcloudGet("createfolderifnotexists", { access_token: token, path: folderPath });
+  const form = new FormData();
+  form.append("file", new Blob([bytes as BlobPart]), filename);
+  const qs = new URLSearchParams({
+    access_token: token,
+    path: folderPath,
+    filename,
+    renameifexists: "0",
+  }).toString();
+  const res = await fetch(`${API_BASE}uploadfile?${qs}`, { method: "POST", body: form });
+  const json = (await res.json()) as { result: number };
+  if (json.result !== 0) {
+    throw new Error(`pCloud uploadfile failed for ${filename}: result=${json.result}`);
+  }
+}
+
+export async function deleteByPath(token: string, filePath: string): Promise<void> {
+  const qs = new URLSearchParams({ access_token: token, path: filePath }).toString();
+  const res = await fetch(`${API_BASE}deletefile?${qs}`);
+  const json = (await res.json()) as { result: number };
+  if (json.result !== 0 && !PCLOUD_NOT_FOUND.has(json.result)) {
+    throw new Error(`pCloud deletefile failed: result=${json.result}`);
+  }
+}
+
 export function accountByName(name: string): PcloudAccount | undefined {
   return loadAccounts().find((a) => a.name === name);
 }

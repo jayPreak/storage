@@ -10,12 +10,14 @@ import {
   encryptPvltObject,
   wrapFileKey,
   encryptManifest,
+  deriveThumbKey,
   bytesToHex,
   type VaultConfig,
   type Manifest,
   type ManifestEntry,
 } from "@/lib/vaultCrypto";
-import { convertHeicToJpeg } from "@/lib/heicConvert";
+import { convertHeicToJpeg, canDecodeNatively } from "@/lib/heicConvert";
+import { createLimiter } from "@/lib/limiter";
 import { extractCapturedTs } from "@/lib/captureDate";
 import { getCachedThumb, putCachedThumb } from "@/lib/thumbCache";
 import { getCachedVideo, putCachedVideo } from "@/lib/videoCache";
@@ -66,6 +68,19 @@ async function makeImageThumbnail(blob: Blob): Promise<Blob> {
   );
 }
 
+// iOS Safari aborts a blob download if the URL is revoked synchronously
+// right after click(), so give it time to start before releasing it.
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
 function formatBytes(n: number): string {
   if (!n || n <= 0) return "0 GB";
   const gb = n / (1024 * 1024 * 1024);
@@ -85,6 +100,177 @@ function dateGroupLabel(ts: number): string {
   return d.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
 }
 
+// Thumbnail pipeline limits. Fetching an already-stored encrypted thumbnail
+// is cheap (a few KB), so that queue is wide. Generating one is expensive
+// -- the full original has to be downloaded and decoded, either by
+// /api/thumbnail (ffmpeg) or in this tab for HEIC -- so those queues are
+// narrow, and videos (which can take a minute server-side) get their own
+// so they can't starve photos. The client decode limiter keeps heavy
+// in-browser decodes to one at a time; unbounded parallel decodes are what
+// used to run phones (and even desktop Chrome) out of memory.
+const storedThumbLimiter = createLimiter(6);
+const photoThumbLimiter = createLimiter(3);
+const videoThumbLimiter = createLimiter(1);
+const clientDecodeLimiter = createLimiter(1);
+const SERVER_THUMB_TIMEOUT_MS = 60_000;
+
+function accountQs(entry: ManifestEntry): string {
+  return entry.extra?.pcloud_account
+    ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
+    : "";
+}
+
+function isHeicEntry(mime: string, filename: string): boolean {
+  return mime.includes("heic") || mime.includes("heif") || /\.hei[cf]$/i.test(filename);
+}
+
+// Stored thumbnails: generated once (by whichever device first needs
+// one), encrypted under a key derived from the file key, and kept in
+// pCloud -- so after that every device just downloads a few KB per tile.
+async function fetchStoredThumb(entry: ManifestEntry, fileKey: Uint8Array): Promise<Blob | null> {
+  try {
+    const res = await fetch(`/api/object/${entry.file_id_hex}/thumb${accountQs(entry)}`);
+    if (!res.ok) return null;
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const { plaintext } = await decryptPvltObject(buf, await deriveThumbKey(fileKey), entry.file_id_hex);
+    return new Blob([plaintext as BlobPart], { type: "image/jpeg" });
+  } catch {
+    return null;
+  }
+}
+
+async function storeThumb(entry: ManifestEntry, fileKey: Uint8Array, blob: Blob): Promise<void> {
+  try {
+    const enc = await encryptPvltObject(
+      new Uint8Array(await blob.arrayBuffer()),
+      await deriveThumbKey(fileKey),
+      entry.file_id_hex,
+      { filename: `${entry.filename}.thumb.jpg`, mime_type: "image/jpeg", created_ts: Date.now() / 1000 }
+    );
+    await fetch(`/api/object/${entry.file_id_hex}/thumb${accountQs(entry)}`, {
+      method: "PUT",
+      body: enc as BodyInit,
+    });
+  } catch {
+    // Best-effort; it'll just be regenerated next time.
+  }
+}
+
+// Shared IntersectionObserver per scroll container. Tiles live inside an
+// overflow:auto container, so the observer's root has to be that container
+// (not the viewport) for rootMargin to actually prefetch rows just below
+// the fold.
+const nearObservers = new Map<Element | null, IntersectionObserver>();
+const nearCallbacks = new Map<Element, (near: boolean) => void>();
+function observeNear(el: Element, cb: (near: boolean) => void): () => void {
+  const root = el.closest("[data-scroll-root]");
+  let observer = nearObservers.get(root);
+  if (!observer) {
+    observer = new IntersectionObserver(
+      (records) => {
+        for (const r of records) nearCallbacks.get(r.target)?.(r.isIntersecting);
+      },
+      { root, rootMargin: "800px 0px" }
+    );
+    nearObservers.set(root, observer);
+  }
+  nearCallbacks.set(el, cb);
+  observer.observe(el);
+  const obs = observer;
+  return () => {
+    nearCallbacks.delete(el);
+    obs.unobserve(el);
+  };
+}
+
+// Queue priority for a tile, computed from where it is *now*: tiles inside
+// the visible area rank top-to-bottom (then left-to-right), then tiles just
+// below the fold, then ones just above it. Lower runs first.
+function tilePriority(el: Element): number {
+  if (!el.isConnected) return Infinity;
+  const root = el.closest("[data-scroll-root]");
+  const view = root ? root.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+  const r = el.getBoundingClientRect();
+  const viewH = view.bottom - view.top;
+  const tieBreak = r.left / 100_000;
+  if (r.bottom < view.top) return viewH + (view.top - r.bottom) + tieBreak;
+  return r.top - view.top + tieBreak;
+}
+
+type TileProps = {
+  entry: ManifestEntry;
+  thumbUrl: string | undefined;
+  selected: boolean;
+  loading: boolean;
+  onOpen: (entry: ManifestEntry) => void;
+  onToggle: (id: string) => void;
+  onNearChange: (entry: ManifestEntry, near: boolean, el: Element) => void;
+};
+
+function Tile({ entry, thumbUrl, selected, loading, onOpen, onToggle, onNearChange }: TileProps) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [near, setNear] = useState(false);
+  const onNearRef = useRef(onNearChange);
+  useEffect(() => {
+    onNearRef.current = onNearChange;
+  });
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    return observeNear(el, (isNear) => {
+      setNear(isNear);
+      onNearRef.current(entry, isNear, el);
+    });
+  }, [entry]);
+
+  const isHeic = isHeicEntry(entry.mime_type, entry.filename);
+  const isVideo = entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
+  return (
+    <div
+      ref={ref}
+      className={`${styles.tile} ${selected ? styles.tileSelected : ""}`}
+      onClick={() => onOpen(entry)}
+    >
+      {/* Only keep the <img> mounted while the tile is near the viewport,
+          so thousands of decoded thumbnails aren't all held in memory at
+          once on a long scroll (iOS Safari kills the tab well before
+          desktop browsers would). */}
+      {thumbUrl && near ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={thumbUrl} alt={entry.filename} className={styles.thumbImg} decoding="async" />
+      ) : (
+        <div className={styles.tilePlaceholder}>
+          <div className={styles.tileIcon}>{isVideo ? "\u{1F3A5}" : "\u{1F5BC}️"}</div>
+        </div>
+      )}
+      <div className={styles.tileOverlay}>
+        <div className={styles.tileName}>{entry.filename}</div>
+        <div className={styles.tileMeta}>
+          {(entry.size / 1024).toFixed(0)} KiB
+          {isHeic ? " · HEIC" : ""}
+        </div>
+      </div>
+      <button
+        className={styles.checkBtn}
+        data-selected={selected}
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggle(entry.file_id_hex);
+        }}
+        aria-label={selected ? "Deselect" : "Select"}
+      >
+        <span className={styles.checkBox}>{selected && "✓"}</span>
+      </button>
+      <div className={styles.lockBadge}>🔒</div>
+      {loading && (
+        <div className={styles.tileLoading}>
+          <span className={styles.spinner} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Home() {
   const [passphrase, setPassphrase] = useState("");
   const [status, setStatus] = useState<string>("");
@@ -94,6 +280,7 @@ export default function Home() {
   const [loadingIds, setLoadingIds] = useState<Set<string>>(new Set());
 
   const [open, setOpen] = useState<OpenState | null>(null);
+  const openIdRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [thumbs, setThumbs] = useState<Record<string, string>>({});
   const thumbsRequested = useRef<Set<string>>(new Set());
@@ -261,10 +448,7 @@ export default function Home() {
   // the entry as a missing-object candidate (see above) instead of
   // silently trashing it.
   async function fetchObjectBytes(entry: ManifestEntry): Promise<Uint8Array> {
-    const accountQs = entry.extra?.pcloud_account
-      ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
-      : "";
-    const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`);
+    const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs(entry)}`);
     if (res.status === 404) {
       flagMissing(entry.file_id_hex);
       throw new Error("object not found in cloud storage");
@@ -281,7 +465,12 @@ export default function Home() {
     // Show the lightbox immediately with whatever we already have (the
     // small cached thumbnail) instead of leaving the user staring at
     // nothing until the full decrypt/transcode finishes.
-    setOpen({
+    openIdRef.current = entry.file_id_hex;
+    setOpen((prev) => {
+      // Prev/next swaps the open item without going through closeLightbox,
+      // so release the previous full-size blob here or every swipe leaks one.
+      if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
+      return {
       entry,
       objectUrl: null,
       mime: entry.mime_type,
@@ -289,15 +478,21 @@ export default function Home() {
       downloadBlob: null,
       loading: true,
       placeholderUrl: thumbs[entry.file_id_hex] ?? null,
+      };
     });
 
     // Later updates only apply if this is still the open item -- guards
     // against a stale async result landing after the user has already
     // navigated to a different one (e.g. rapid prev/next).
-    const patchOpen = (patch: Partial<OpenState>) =>
+    const patchOpen = (patch: Partial<OpenState>) => {
+      if (openIdRef.current !== entry.file_id_hex) {
+        if (patch.objectUrl) URL.revokeObjectURL(patch.objectUrl);
+        return;
+      }
       setOpen((prev) =>
         prev && prev.entry.file_id_hex === entry.file_id_hex ? { ...prev, ...patch } : prev
       );
+    };
 
     try {
       const buf = await fetchObjectBytes(entry);
@@ -315,20 +510,43 @@ export default function Home() {
         entry.file_id_hex
       );
 
-      const isHeic =
-        metadata.mime_type.includes("heic") ||
-        metadata.filename.toLowerCase().endsWith(".heic");
+      const isHeic = isHeicEntry(metadata.mime_type, metadata.filename);
       const isMov =
         metadata.mime_type.includes("quicktime") ||
         metadata.filename.toLowerCase().endsWith(".mov");
 
-      const rawBlob = new Blob([plaintext.buffer as ArrayBuffer], {
-        type: metadata.mime_type,
+      const rawBlob = new Blob([plaintext as BlobPart], {
+        type: isHeic ? "image/heic" : metadata.mime_type,
       });
 
-      if (isHeic) {
+      // Opening a photo already paid for the full download + decode, so if
+      // its tile has no thumbnail yet, make one from it now (and store it)
+      // rather than leaving the grid to regenerate it from scratch.
+      const backfillThumb = (source: Blob) => {
+        if (thumbs[entry.file_id_hex]) return;
+        makeImageThumbnail(source)
+          .then((t) => {
+            showThumb(entry.file_id_hex, t);
+            void storeThumb(entry, fileKey, t);
+          })
+          .catch(() => {});
+      };
+
+      if (isHeic && (await canDecodeNatively(rawBlob))) {
+        backfillThumb(rawBlob);
+        // Safari (iOS 17+ / macOS 14+) shows HEIC as-is -- no conversion,
+        // no extra full-size JPEG copy in memory.
+        patchOpen({
+          objectUrl: URL.createObjectURL(rawBlob),
+          mime: "image/heic",
+          note: "",
+          downloadBlob: rawBlob,
+          loading: false,
+        });
+      } else if (isHeic) {
         try {
-          const jpegBlob = await convertHeicToJpeg(plaintext);
+          const jpegBlob = await clientDecodeLimiter(() => convertHeicToJpeg(rawBlob));
+          backfillThumb(jpegBlob);
           patchOpen({
             objectUrl: URL.createObjectURL(jpegBlob),
             mime: "image/jpeg",
@@ -387,6 +605,7 @@ export default function Home() {
           });
         }
       } else {
+        if (metadata.mime_type.startsWith("image/")) backfillThumb(rawBlob);
         patchOpen({
           objectUrl: URL.createObjectURL(rawBlob),
           mime: metadata.mime_type,
@@ -406,88 +625,149 @@ export default function Home() {
   }
 
   async function loadThumbnailClientSide(entry: ManifestEntry): Promise<Blob> {
-    const buf = await fetchObjectBytes(entry);
-    const fileKey = await unwrapFileKey(
-      unlocked!.wrapKey,
-      entry.wrap_nonce_hex,
-      entry.wrapped_key_hex,
-      entry.file_id_hex
-    );
-    const { metadata, plaintext } = await decryptPvltObject(buf, fileKey, entry.file_id_hex);
-    const isHeic =
-      metadata.mime_type.includes("heic") || metadata.filename.toLowerCase().endsWith(".heic");
-    const sourceBlob = isHeic
-      ? await convertHeicToJpeg(plaintext)
-      : new Blob([plaintext.buffer as ArrayBuffer], { type: metadata.mime_type });
-    return makeImageThumbnail(sourceBlob);
+    return clientDecodeLimiter(async () => {
+      let sourceBlob: Blob;
+      {
+        // Scoped so the ciphertext/plaintext buffers can be collected as
+        // soon as the source blob exists.
+        const buf = await fetchObjectBytes(entry);
+        const fileKey = await unwrapFileKey(
+          unlocked!.wrapKey,
+          entry.wrap_nonce_hex,
+          entry.wrapped_key_hex,
+          entry.file_id_hex
+        );
+        const { metadata, plaintext } = await decryptPvltObject(buf, fileKey, entry.file_id_hex);
+        const mime = isHeicEntry(metadata.mime_type, metadata.filename)
+          ? "image/heic"
+          : metadata.mime_type;
+        sourceBlob = new Blob([plaintext as BlobPart], { type: mime });
+      }
+      if (sourceBlob.type === "image/heic") {
+        // Safari (every iPhone this targets) decodes HEIC natively via
+        // createImageBitmap -- far cheaper than the WASM decoder.
+        try {
+          return await makeImageThumbnail(sourceBlob);
+        } catch {
+          sourceBlob = await convertHeicToJpeg(sourceBlob);
+        }
+      }
+      return makeImageThumbnail(sourceBlob);
+    });
   }
 
+  // Tiles report when they come near / leave the viewport. Only tiles that
+  // are (still) near when their turn in the queue comes up get processed;
+  // the rest are dropped and re-requested if they scroll back into range.
+  const nearIds = useRef<Set<string>>(new Set());
+  const tileEls = useRef<Map<string, Element>>(new Map());
+  function handleTileNear(entry: ManifestEntry, near: boolean, el: Element) {
+    if (near) {
+      nearIds.current.add(entry.file_id_hex);
+      tileEls.current.set(entry.file_id_hex, el);
+      void loadThumbnail(entry);
+    } else {
+      nearIds.current.delete(entry.file_id_hex);
+      tileEls.current.delete(entry.file_id_hex);
+    }
+  }
+
+  function showThumb(id: string, blob: Blob) {
+    thumbsRequested.current.add(id);
+    setThumbs((prev) => {
+      if (prev[id]) URL.revokeObjectURL(prev[id]);
+      return { ...prev, [id]: URL.createObjectURL(blob) };
+    });
+    void putCachedThumb(id, blob);
+  }
+
+  async function generateThumb(entry: ManifestEntry, fileKey: Uint8Array): Promise<Blob | null> {
+    const isVideo = entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
+    // HEIC can't be decoded server-side here (no libheif in ffmpeg-static
+    // or sharp's build) -- skip straight to the client-side decoder
+    // instead of wasting a round trip that's guaranteed to 422.
+    if (isHeicEntry(entry.mime_type, entry.filename)) return loadThumbnailClientSide(entry);
+    try {
+      const res = await fetch("/api/thumbnail", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file_id_hex: entry.file_id_hex,
+          file_key_hex: bytesToHex(fileKey),
+          account: entry.extra?.pcloud_account,
+          is_video: isVideo,
+        }),
+        signal: AbortSignal.timeout(SERVER_THUMB_TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error("server thumbnail failed");
+      return await res.blob();
+    } catch {
+      if (isVideo) return null; // no client-side fallback for video posters
+      return loadThumbnailClientSide(entry);
+    }
+  }
+
+  // Order: this device's IndexedDB cache -> stored encrypted thumbnail ->
+  // generate one (then store it for next time). Each queued step first
+  // checks the tile is still near the viewport; if it was scrolled away
+  // it's dropped and re-requested when it comes back into range.
   async function loadThumbnail(entry: ManifestEntry) {
     if (!unlocked) return;
+    const id = entry.file_id_hex;
+    if (thumbsRequested.current.has(id)) return;
+    thumbsRequested.current.add(id);
     const isVideo = entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
-    const isHeic = entry.mime_type.includes("heic") || entry.filename.toLowerCase().endsWith(".heic");
-    if (thumbsRequested.current.has(entry.file_id_hex)) return;
-    thumbsRequested.current.add(entry.file_id_hex);
+    let settled = false;
+    const priority = () => {
+      const el = tileEls.current.get(id);
+      return el ? tilePriority(el) : Infinity;
+    };
     try {
-      const cached = await getCachedThumb(entry.file_id_hex);
+      const cached = await getCachedThumb(id);
       if (cached) {
-        setThumbs((prev) => ({ ...prev, [entry.file_id_hex]: URL.createObjectURL(cached) }));
+        settled = true;
+        showThumb(id, cached);
         return;
       }
 
-      let thumbBlob: Blob;
-      // HEIC can't be decoded server-side here (no libheif in ffmpeg-static
-      // or sharp's build) -- skip straight to the client-side WASM decoder
-      // instead of wasting a round trip that's guaranteed to 422.
-      if (isHeic) {
-        thumbBlob = await loadThumbnailClientSide(entry);
-      } else {
-        try {
-          const fileKey = await unwrapFileKey(
-            unlocked.wrapKey,
-            entry.wrap_nonce_hex,
-            entry.wrapped_key_hex,
-            entry.file_id_hex
-          );
-          const res = await fetch("/api/thumbnail", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              file_id_hex: entry.file_id_hex,
-              file_key_hex: bytesToHex(fileKey),
-              account: entry.extra?.pcloud_account,
-              is_video: isVideo,
-            }),
-          });
-          if (!res.ok) throw new Error("server thumbnail failed");
-          thumbBlob = await res.blob();
-        } catch {
-          if (isVideo) return; // no client-side fallback for video posters
-          thumbBlob = await loadThumbnailClientSide(entry);
-        }
+      const fileKey = await unwrapFileKey(unlocked.wrapKey, entry.wrap_nonce_hex, entry.wrapped_key_hex, id);
+
+      const stored = await storedThumbLimiter(
+        async () => (nearIds.current.has(id) ? fetchStoredThumb(entry, fileKey) : undefined),
+        priority
+      );
+      if (stored === undefined) return;
+      if (stored) {
+        settled = true;
+        showThumb(id, stored);
+        return;
       }
 
-      setThumbs((prev) => ({ ...prev, [entry.file_id_hex]: URL.createObjectURL(thumbBlob) }));
-      void putCachedThumb(entry.file_id_hex, thumbBlob);
+      const generated = await (isVideo ? videoThumbLimiter : photoThumbLimiter)(
+        async () => (nearIds.current.has(id) ? generateThumb(entry, fileKey) : undefined),
+        priority
+      );
+      if (generated === undefined) return;
+      settled = true;
+      if (!generated) return;
+      showThumb(id, generated);
+      void storeThumb(entry, fileKey, generated);
     } catch {
       // Thumbnail is best-effort; leave the icon placeholder on failure.
+      settled = true;
+    } finally {
+      if (!settled) thumbsRequested.current.delete(id);
     }
   }
 
   function handleDownload() {
     if (!open?.downloadBlob) return;
-    const url = URL.createObjectURL(open.downloadBlob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = open.entry.filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
+    saveBlob(open.downloadBlob, open.entry.filename);
   }
 
   function closeLightbox() {
     if (open?.objectUrl) URL.revokeObjectURL(open.objectUrl);
+    openIdRef.current = null;
     setOpen(null);
   }
 
@@ -609,7 +889,7 @@ export default function Home() {
       entry.file_id_hex
     );
     const { metadata, plaintext } = await decryptPvltObject(buf, fileKey, entry.file_id_hex);
-    return new Blob([plaintext.buffer as ArrayBuffer], { type: metadata.mime_type });
+    return new Blob([plaintext as BlobPart], { type: metadata.mime_type });
   }
 
   async function handleBulkDownload() {
@@ -622,15 +902,7 @@ export default function Home() {
         const entry = unlocked.manifest.entries[id];
         if (!entry) continue;
         setStatus(`Downloading ${entry.filename}...`);
-        const blob = await decryptEntryToBlob(entry);
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = entry.filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
+        saveBlob(await decryptEntryToBlob(entry), entry.filename);
       }
       setStatus(`Downloaded ${ids.length} item(s).`);
       clearSelection();
@@ -700,11 +972,8 @@ export default function Home() {
       for (const id of ids) {
         const entry = unlocked.manifest.entries[id];
         if (!entry) continue;
-        const accountQs = entry.extra?.pcloud_account
-          ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
-          : "";
         try {
-          const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs}`, { method: "DELETE" });
+          const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs(entry)}`, { method: "DELETE" });
           if (!res.ok) failures.push(entry.filename);
         } catch {
           failures.push(entry.filename);
@@ -736,13 +1005,6 @@ export default function Home() {
     ? baseEntries.filter((e) => e.filename.toLowerCase().includes(searchLower))
     : baseEntries
   ).sort((a, b) => capturedOf(b) - capturedOf(a));
-
-  useEffect(() => {
-    libraryEntries.forEach((entry) => {
-      void loadThumbnail(entry);
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [libraryEntries.map((e) => e.file_id_hex).join(",")]);
 
   useEffect(() => {
     if (!open) return;
@@ -1136,7 +1398,7 @@ export default function Home() {
               folderYearsSorted.length === 0 ? (
                 <div className={styles.emptyState}>No items yet. Upload a photo or video to get started.</div>
               ) : (
-                <div className={`${styles.gridScroll} om-scroll`}>
+                <div className={`${styles.gridScroll} om-scroll`} data-scroll-root>
                   <div className={styles.folderGrid}>
                     {folderYearsSorted.map((y) => {
                       const count = Array.from(folderYears.get(y)!.values()).reduce(
@@ -1161,7 +1423,7 @@ export default function Home() {
                 </div>
               )
             ) : view === "folders" && folderPath.month === undefined ? (
-              <div className={`${styles.gridScroll} om-scroll`}>
+              <div className={`${styles.gridScroll} om-scroll`} data-scroll-root>
                 <div className={styles.folderGrid}>
                   {MONTH_NAMES.map((name, m) => {
                     const days = folderMonths?.get(m);
@@ -1186,7 +1448,7 @@ export default function Home() {
                 </div>
               </div>
             ) : view === "folders" && folderPath.day === undefined ? (
-              <div className={`${styles.gridScroll} om-scroll`}>
+              <div className={`${styles.gridScroll} om-scroll`} data-scroll-root>
                 <div className={styles.folderGrid}>
                   {Array.from(folderDays?.keys() ?? [])
                     .sort((a, b) => a - b)
@@ -1212,58 +1474,23 @@ export default function Home() {
               (folderDayEntries ?? []).length === 0 ? (
                 <div className={styles.emptyState}>No items on this day.</div>
               ) : (
-                <div className={`${styles.gridScroll} om-scroll`}>
+                <div className={`${styles.gridScroll} om-scroll`} data-scroll-root>
                   <div
                     className={styles.grid}
                     style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${gridMinPx}px, 1fr))` }}
                   >
-                    {(folderDayEntries ?? []).map((entry) => {
-                      const isHeic = entry.mime_type.includes("heic");
-                      const isVideo =
-                        entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
-                      const thumbUrl = thumbs[entry.file_id_hex];
-                      const selected = !!selectedIds[entry.file_id_hex];
-                      return (
-                        <div
-                          key={entry.file_id_hex}
-                          className={`${styles.tile} ${selected ? styles.tileSelected : ""}`}
-                          onClick={() => handleOpen(entry)}
-                        >
-                          {thumbUrl ? (
-                            // eslint-disable-next-line @next/next/no-img-element
-                            <img src={thumbUrl} alt={entry.filename} className={styles.thumbImg} />
-                          ) : (
-                            <div className={styles.tilePlaceholder}>
-                              <div className={styles.tileIcon}>{isVideo ? "\u{1F3A5}" : "\u{1F5BC}️"}</div>
-                            </div>
-                          )}
-                          <div className={styles.tileOverlay}>
-                            <div className={styles.tileName}>{entry.filename}</div>
-                            <div className={styles.tileMeta}>
-                              {(entry.size / 1024).toFixed(0)} KiB
-                              {isHeic ? " · HEIC" : ""}
-                            </div>
-                          </div>
-                          <button
-                            className={styles.checkBtn}
-                            data-selected={selected}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              toggleSelect(entry.file_id_hex);
-                            }}
-                            aria-label={selected ? "Deselect" : "Select"}
-                          >
-                            {selected && "✓"}
-                          </button>
-                          <div className={styles.lockBadge}>🔒</div>
-                          {loadingIds.has(entry.file_id_hex) && (
-                            <div className={styles.tileLoading}>
-                              <span className={styles.spinner} />
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
+                    {(folderDayEntries ?? []).map((entry) => (
+                      <Tile
+                        key={entry.file_id_hex}
+                        entry={entry}
+                        thumbUrl={thumbs[entry.file_id_hex]}
+                        selected={!!selectedIds[entry.file_id_hex]}
+                        loading={loadingIds.has(entry.file_id_hex)}
+                        onOpen={handleOpen}
+                        onToggle={toggleSelect}
+                        onNearChange={handleTileNear}
+                      />
+                    ))}
                   </div>
                 </div>
               )
@@ -1276,7 +1503,7 @@ export default function Home() {
                   : "No items yet. Upload a photo or video to get started."}
               </div>
             ) : (
-              <div className={`${styles.gridScroll} om-scroll`}>
+              <div className={`${styles.gridScroll} om-scroll`} data-scroll-root>
                 {dateGroups.map((group) => (
                   <div key={group.label} className={styles.dateGroup}>
                     <div className={styles.dateLabel}>{group.label}</div>
@@ -1284,53 +1511,18 @@ export default function Home() {
                       className={styles.grid}
                       style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${gridMinPx}px, 1fr))` }}
                     >
-                      {group.entries.map((entry) => {
-                        const isHeic = entry.mime_type.includes("heic");
-                        const isVideo =
-                          entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
-                        const thumbUrl = thumbs[entry.file_id_hex];
-                        const selected = !!selectedIds[entry.file_id_hex];
-                        return (
-                          <div
-                            key={entry.file_id_hex}
-                            className={`${styles.tile} ${selected ? styles.tileSelected : ""}`}
-                            onClick={() => handleOpen(entry)}
-                          >
-                            {thumbUrl ? (
-                              // eslint-disable-next-line @next/next/no-img-element
-                              <img src={thumbUrl} alt={entry.filename} className={styles.thumbImg} />
-                            ) : (
-                              <div className={styles.tilePlaceholder}>
-                                <div className={styles.tileIcon}>{isVideo ? "\u{1F3A5}" : "\u{1F5BC}️"}</div>
-                              </div>
-                            )}
-                            <div className={styles.tileOverlay}>
-                              <div className={styles.tileName}>{entry.filename}</div>
-                              <div className={styles.tileMeta}>
-                                {(entry.size / 1024).toFixed(0)} KiB
-                                {isHeic ? " · HEIC" : ""}
-                              </div>
-                            </div>
-                            <button
-                              className={styles.checkBtn}
-                              data-selected={selected}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                toggleSelect(entry.file_id_hex);
-                              }}
-                              aria-label={selected ? "Deselect" : "Select"}
-                            >
-                              {selected && "✓"}
-                            </button>
-                            <div className={styles.lockBadge}>🔒</div>
-                            {loadingIds.has(entry.file_id_hex) && (
-                              <div className={styles.tileLoading}>
-                                <span className={styles.spinner} />
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
+                      {group.entries.map((entry) => (
+                      <Tile
+                        key={entry.file_id_hex}
+                        entry={entry}
+                        thumbUrl={thumbs[entry.file_id_hex]}
+                        selected={!!selectedIds[entry.file_id_hex]}
+                        loading={loadingIds.has(entry.file_id_hex)}
+                        onOpen={handleOpen}
+                        onToggle={toggleSelect}
+                        onNearChange={handleTileNear}
+                      />
+                    ))}
                     </div>
                   </div>
                 ))}
@@ -1349,11 +1541,13 @@ export default function Home() {
                 Library
               </button>
               <button
-                className={styles.bottomTab}
-                disabled
-                title="Folders aren't implemented yet -- see FEATURES.md"
+                className={`${styles.bottomTab} ${view === "folders" ? styles.bottomTabActive : ""}`}
+                onClick={() => {
+                  setView("folders");
+                  setFolderPath({});
+                }}
               >
-                <span className={styles.navDot} />
+                <span className={styles.navDot} data-active={view === "folders"} />
                 Folders
               </button>
               <button

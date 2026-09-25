@@ -162,6 +162,15 @@ export async function deriveSubkeys(
   return { headerKey, wrapKey };
 }
 
+// Stored thumbnails are encrypted under their own key derived from the
+// file key (not the file key itself), so the server can't swap a
+// thumbnail's ciphertext in for the original's and have it decrypt.
+const THUMB_KEY_LABEL = new TextEncoder().encode("vault-thumb-key-v1");
+
+export async function deriveThumbKey(fileKey: Uint8Array): Promise<Uint8Array> {
+  return hmacSha256(fileKey, THUMB_KEY_LABEL);
+}
+
 // ---------------------------------------------------------------------------
 // AES-256-GCM via WebCrypto (or Node's `crypto.webcrypto` in the test
 // harness). AAD support via additionalData.
@@ -306,8 +315,12 @@ export async function decryptPvltObject(
 ): Promise<{ metadata: FileMetadata; plaintext: Uint8Array }> {
   const fileId = hexToBytes(fileIdHex);
 
+  // subarray() views instead of slice() copies, and chunks are written
+  // straight into one preallocated output buffer -- peak memory is roughly
+  // ciphertext + plaintext instead of ~5x the file size, which matters a
+  // lot for multi-MB photos / large videos on phones.
   let off = 0;
-  const magic = buf.slice(off, off + 4);
+  const magic = buf.subarray(off, off + 4);
   off += 4;
   if (bytesToHex(magic) !== bytesToHex(MAGIC)) {
     throw new Error("not a vault file (bad magic)");
@@ -317,30 +330,35 @@ export async function decryptPvltObject(
   if (version !== 1) {
     throw new Error(`unsupported vault file format version ${version}`);
   }
-  const headerNonce = buf.slice(off, off + NONCE_LEN);
+  const headerNonce = buf.subarray(off, off + NONCE_LEN);
   off += NONCE_LEN;
   const headerLen = new DataView(buf.buffer, buf.byteOffset + off, 4).getUint32(0, false);
   off += 4;
-  const headerCt = buf.slice(off, off + headerLen);
+  const headerCt = buf.subarray(off, off + headerLen);
   off += headerLen;
 
   const headerPlain = await aesGcmDecrypt(fileKey, headerNonce, headerCt, fileId);
   const metadata: FileMetadata = JSON.parse(new TextDecoder().decode(headerPlain));
 
-  const chunks: Uint8Array[] = [];
+  const out = new Uint8Array(metadata.size);
+  let outOff = 0;
   for (let idx = 0; idx < metadata.num_chunks; idx++) {
-    const nonce = buf.slice(off, off + NONCE_LEN);
+    const nonce = buf.subarray(off, off + NONCE_LEN);
     off += NONCE_LEN;
     const maxCtLen = metadata.chunk_size + TAG_LEN;
     const remaining = buf.length - off;
     const ctLen = Math.min(maxCtLen, remaining);
-    const ct = buf.slice(off, off + ctLen);
+    const ct = buf.subarray(off, off + ctLen);
     off += ctLen;
     const plain = await aesGcmDecrypt(fileKey, nonce, ct, chunkAad(fileId, idx));
-    chunks.push(plain);
+    if (outOff + plain.length > out.length) {
+      throw new Error("decrypted size exceeds header size");
+    }
+    out.set(plain, outOff);
+    outOff += plain.length;
   }
 
-  const plaintext = concatBytes(...chunks);
+  const plaintext = outOff === out.length ? out : out.subarray(0, outOff);
   return { metadata, plaintext };
 }
 
@@ -364,22 +382,11 @@ export async function encryptPvltObject(
   const digest = await getCrypto().subtle.digest("SHA-256", plaintext as BufferSource);
   const sha256Plain = bytesToHex(new Uint8Array(digest));
 
-  const chunks: Uint8Array[] = [];
-  let numChunks = 0;
-  if (plaintext.length === 0) {
-    const nonce = randomBytes(NONCE_LEN);
-    const ct = await aesGcmEncrypt(fileKey, nonce, new Uint8Array(0), chunkAad(fileId, 0));
-    chunks.push(concatBytes(nonce, ct));
-    numChunks = 1;
-  } else {
-    for (let off = 0; off < plaintext.length; off += chunkSize) {
-      const plain = plaintext.slice(off, off + chunkSize);
-      const nonce = randomBytes(NONCE_LEN);
-      const ct = await aesGcmEncrypt(fileKey, nonce, plain, chunkAad(fileId, numChunks));
-      chunks.push(concatBytes(nonce, ct));
-      numChunks++;
-    }
-  }
+  // Header first (num_chunks is known up front), then every chunk is
+  // encrypted straight into one preallocated output buffer -- avoids
+  // holding plaintext + per-chunk copies + a final concat all at once,
+  // which is what tends to kill mobile Safari on large videos.
+  const numChunks = plaintext.length === 0 ? 1 : Math.ceil(plaintext.length / chunkSize);
 
   const metadata: FileMetadata = {
     filename: metadataIn.filename,
@@ -396,8 +403,29 @@ export async function encryptPvltObject(
   const headerNonce = randomBytes(NONCE_LEN);
   const headerCt = await aesGcmEncrypt(fileKey, headerNonce, headerPlain, fileId);
 
-  const headerLen = new Uint8Array(4);
-  new DataView(headerLen.buffer).setUint32(0, headerCt.length, false);
+  const prefixLen = MAGIC.length + 1 + NONCE_LEN + 4 + headerCt.length;
+  const out = new Uint8Array(prefixLen + numChunks * (NONCE_LEN + TAG_LEN) + plaintext.length);
+  let off = 0;
+  out.set(MAGIC, off);
+  off += MAGIC.length;
+  out[off] = 1;
+  off += 1;
+  out.set(headerNonce, off);
+  off += NONCE_LEN;
+  new DataView(out.buffer).setUint32(off, headerCt.length, false);
+  off += 4;
+  out.set(headerCt, off);
+  off += headerCt.length;
 
-  return concatBytes(MAGIC, Uint8Array.of(1), headerNonce, headerLen, headerCt, ...chunks);
+  for (let idx = 0; idx < numChunks; idx++) {
+    const plain = plaintext.subarray(idx * chunkSize, Math.min(plaintext.length, (idx + 1) * chunkSize));
+    const nonce = randomBytes(NONCE_LEN);
+    const ct = await aesGcmEncrypt(fileKey, nonce, plain, chunkAad(fileId, idx));
+    out.set(nonce, off);
+    off += NONCE_LEN;
+    out.set(ct, off);
+    off += ct.length;
+  }
+
+  return out;
 }

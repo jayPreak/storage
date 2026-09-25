@@ -4,7 +4,7 @@
 // All decryption happens client-side.
 import { NextResponse } from "next/server";
 import { isValidFileIdHex } from "@/lib/vaultPaths";
-import { accountByName, findAccountHoldingFile, ensureVaultFolder, getFileidInFolder, getFileLink, deleteFile } from "@/lib/pcloudServer";
+import { accountByName, findAccountHoldingFile, ensureVaultFolder, getFileidInFolder, getFileLink, deleteFile, deleteByPath, primaryAccount } from "@/lib/pcloudServer";
 
 export async function GET(
   req: Request,
@@ -85,6 +85,10 @@ export async function DELETE(
     }
 
     await deleteFile(account.token, fileid);
+    // Best-effort: also drop the stored thumbnail (see ./thumb/route.ts for
+    // which account it lives in). An orphaned thumb is harmless ciphertext.
+    const thumbAccount = accountName ? account : primaryAccount();
+    await deleteByPath(thumbAccount.token, `/vault-thumbs/${fileId}.pvlt`).catch(() => {});
     return NextResponse.json({ ok: true });
   } catch (e) {
     return NextResponse.json(
