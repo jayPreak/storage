@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // Deletes local files from WATCH_DIR that upload-iphone-pics.mjs already
 // confirmed as uploaded ("OK: ..." lines, and the "Full uploaded list"
-// summary lines it prints at the end) or skipped because they were already
-// in the manifest ("SKIP (already in manifest): ...").
+// summary lines it prints at the end), skipped because they were already
+// in the manifest ("SKIP (already in manifest): ..."), or skipped because
+// they're empty ("SKIP (0 bytes): ..." -- nothing to lose, and they'd
+// otherwise sit in the folder forever since they're never uploaded).
 //
-// Does NOT delete anything logged as FAIL, or SKIP (0 bytes) -- those were
-// never (successfully) uploaded.
+// Does NOT delete anything logged as FAIL -- those were never
+// (successfully) uploaded.
 //
 // Since upload-iphone-pics.mjs now writes a fresh timestamped results file
 // per run (~/vault-upload-results-<timestamp>.txt), pass the path to the
@@ -57,13 +59,13 @@ function main() {
     } else if ((m = line.match(/^\s{2}(.+?) \(\d+ bytes\) -> \S+$/))) {
       // "Full uploaded list" summary lines, e.g. "  IMG_0898.HEIC (1658890 bytes) -> pcloud2"
       toDelete.add(m[1]);
-    } else if ((m = line.match(/^SKIP \(already in manifest\): (.+)$/))) {
+    } else if ((m = line.match(/^SKIP \((?:already in manifest|0 bytes)\): (.+)$/))) {
       toDelete.add(m[1]);
     }
   }
 
   if (toDelete.size === 0) {
-    console.log("No OK/uploaded/SKIP (already in manifest) entries found in results file.");
+    console.log("No OK/uploaded/SKIP (already in manifest / 0 bytes) entries found in results file.");
     return;
   }
 
