@@ -12,6 +12,7 @@ import {
   encryptManifest,
   deriveThumbKey,
   bytesToHex,
+  hexToBytes,
   type VaultConfig,
   type Manifest,
   type ManifestEntry,
@@ -163,6 +164,16 @@ const SERVER_THUMB_TIMEOUT_MS = 60_000;
 // Permanent deletes (e.g. emptying a big Trash) run a few at a time.
 const cloudDeleteLimiter = createLimiter(4);
 
+// DEV/BENCH-ONLY fixture mode (see lib/fixtureServer.ts). Only switched on
+// when the URL has ?fixture=1 AND the server's /api/fixture/* routes exist
+// (they 404 unless VAULT_FIXTURE_DIR is set, which it never is on Vercel).
+// It swaps only the API endpoints; every fetch/unwrap/decrypt/render step
+// below stays the real one.
+let fixtureMode = false;
+function api(path: string): string {
+  return fixtureMode ? path.replace(/^\/api\//, "/api/fixture/") : path;
+}
+
 function accountQs(entry: ManifestEntry): string {
   const ref = resolveBackend(entry.extra);
   return ref
@@ -185,7 +196,7 @@ function isHeicEntry(mime: string, filename: string): boolean {
 // pCloud -- so after that every device just downloads a few KB per tile.
 async function fetchStoredThumb(entry: ManifestEntry, fileKey: Uint8Array): Promise<Blob | null> {
   try {
-    const res = await fetch(`/api/object/${entry.file_id_hex}/thumb${accountQs(entry)}`);
+    const res = await fetch(api(`/api/object/${entry.file_id_hex}/thumb${accountQs(entry)}`));
     if (!res.ok) return null;
     const buf = new Uint8Array(await res.arrayBuffer());
     const { plaintext } = await decryptPvltObject(buf, await deriveThumbKey(fileKey), entry.file_id_hex);
@@ -203,7 +214,7 @@ async function storeThumb(entry: ManifestEntry, fileKey: Uint8Array, blob: Blob)
       entry.file_id_hex,
       { filename: `${entry.filename}.thumb.jpg`, mime_type: "image/jpeg", created_ts: Date.now() / 1000 }
     );
-    await fetch(`/api/object/${entry.file_id_hex}/thumb${accountQs(entry)}`, {
+    await fetch(api(`/api/object/${entry.file_id_hex}/thumb${accountQs(entry)}`), {
       method: "PUT",
       body: enc as BodyInit,
     });
@@ -414,7 +425,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!unlocked) return;
-    fetch("/api/storage")
+    fetch(api("/api/storage"))
       .then((r) => (r.ok ? r.json() : null))
       .then((j) => {
         if (j && typeof j.quota === "number") {
@@ -558,10 +569,41 @@ export default function Home() {
     }
   }
 
+  // DEV/BENCH-ONLY: ?fixture=1 loads the synthetic fixture vault instead of
+  // showing the unlock screen -- but only if the fixture routes answer.
+  // Normal visits (and any server without VAULT_FIXTURE_DIR) are untouched.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("fixture") !== "1") return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const manifestRes = await fetch("/api/fixture/manifest");
+        if (!manifestRes.ok) return;
+        const sessionRes = await fetch("/api/fixture/session");
+        if (!sessionRes.ok) return;
+        const { header_key_hex, wrap_key_hex } = (await sessionRes.json()) as {
+          header_key_hex: string;
+          wrap_key_hex: string;
+        };
+        const headerKey = hexToBytes(header_key_hex);
+        const manifest = await decryptManifest(new Uint8Array(await manifestRes.arrayBuffer()), headerKey);
+        if (cancelled) return;
+        fixtureMode = true;
+        setUnlocked({ wrapKey: hexToBytes(wrap_key_hex), headerKey, manifest });
+        setStatus(`Fixture mode. ${Object.keys(manifest.entries).length} items loaded.`);
+      } catch {
+        // Fixture unavailable -- fall back to the normal unlock screen.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   async function persistManifest(manifest: Manifest) {
     if (!unlocked) return;
     const manifestBlob = await encryptManifest(unlocked.headerKey, manifest);
-    const res = await fetch("/api/manifest", { method: "POST", body: manifestBlob as BodyInit });
+    const res = await fetch(api("/api/manifest"), { method: "POST", body: manifestBlob as BodyInit });
     if (!res.ok) throw new Error("failed to save manifest");
     setUnlocked((prev) => (prev ? { ...prev, manifest } : prev));
   }
@@ -610,7 +652,7 @@ export default function Home() {
   // the entry as a missing-object candidate (see above) instead of
   // silently trashing it.
   async function fetchObjectBytes(entry: ManifestEntry): Promise<Uint8Array> {
-    const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs(entry)}`);
+    const res = await fetch(api(`/api/object/${entry.file_id_hex}${accountQs(entry)}`));
     if (res.status === 404) {
       flagMissing(entry.file_id_hex);
       throw new Error("object not found in cloud storage");
@@ -732,7 +774,7 @@ export default function Home() {
           let mp4Blob = await getCachedVideo(entry.file_id_hex);
           if (!mp4Blob) {
             setStatus(`Transcoding ${entry.filename} for playback...`);
-            const transcodeRes = await fetch("/api/transcode", {
+            const transcodeRes = await fetch(api("/api/transcode"), {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -850,7 +892,7 @@ export default function Home() {
     // instead of wasting a round trip that's guaranteed to 422.
     if (isHeicEntry(entry.mime_type, entry.filename)) return loadThumbnailClientSide(entry);
     try {
-      const res = await fetch("/api/thumbnail", {
+      const res = await fetch(api("/api/thumbnail"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -984,7 +1026,7 @@ export default function Home() {
 
         setStatus(`Uploading ${file.name}...`);
         const uploadRes = await fetch(
-          `/api/upload?fileId=${fileIdHex}&filename=${encodeURIComponent(fileIdHex + ".pvlt")}`,
+          api(`/api/upload?fileId=${fileIdHex}&filename=${encodeURIComponent(fileIdHex + ".pvlt")}`),
           { method: "POST", body: encrypted as BodyInit }
         );
         if (!uploadRes.ok) throw new Error(`upload failed for ${file.name}`);
@@ -1173,7 +1215,7 @@ export default function Home() {
             const entry = unlocked.manifest.entries[id];
             if (!entry) return;
             try {
-              const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs(entry)}`, { method: "DELETE" });
+              const res = await fetch(api(`/api/object/${entry.file_id_hex}${accountQs(entry)}`), { method: "DELETE" });
               if (!res.ok) failures.push(entry.filename);
             } catch {
               failures.push(entry.filename);

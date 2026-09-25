@@ -131,3 +131,33 @@ Behavior:
 To point it at a different folder, edit `WATCH_DIR` at the top of the
 script (it isn't read from an env var, unlike the Python watcher's
 `VAULT_WATCH_DIR`).
+
+## Fixture mode (dev/bench only)
+
+For benchmarking and UI work without a passphrase or any cloud account, the
+app can run against a synthetic vault of generated test files:
+
+```bash
+VAULT_FIXTURE_DIR=/path/to/fixtures PORT=3101 npx next start   # or: npx next dev
+# then open http://localhost:3101/?fixture=1
+```
+
+`VAULT_FIXTURE_DIR` must contain `bench-5k.json` (an array of
+`{filename, captured_ts, mime_type, size, width, height}`) and a `bench-5k/`
+folder holding those files.
+
+- Everything lives under `/api/fixture/*` (`lib/fixtureServer.ts`). Every
+  one of those routes returns 404 unless `VAULT_FIXTURE_DIR` is set, and it
+  is never set on Vercel, so production is unaffected. Without `?fixture=1`
+  the app behaves exactly as normal.
+- The synthetic vault's keys come from a fixed public constant, not from a
+  passphrase. The server encrypts the fixture files on the fly in the real
+  `.pvlt` and manifest formats, so the client's real fetch, unwrap, decrypt
+  and render path runs. Only the API base path changes.
+- Entries get stable file ids. 40 of them are deterministically marked as
+  deleted, so Trash is not empty. Video thumbnails are ffmpeg poster frames.
+- Uploads go to `/api/fixture/upload`, which simulates about 5 MB/s per file.
+  Manifest saves (trash, restore, delete forever, empty trash), uploads and
+  stored thumbnails are kept in server memory for the life of the process.
+  `/api/fixture/storage` reports a 15 GB quota, with used space equal to the
+  sum of the entry sizes.
