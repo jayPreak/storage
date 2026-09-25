@@ -74,7 +74,7 @@ B2_ACCOUNTS=[{"name":"b2main","keyId":"...","applicationKey":"...","bucketId":".
 ```
 
 - `quotaBytes` is your self-imposed cap (B2 has no quota API). A 200MB safety margin is kept below it.
-- B2 has no live "used bytes" API, so usage is tracked in the `b2` section of the unencrypted `storage-summary.json` (primary pCloud account's `vault` folder), updated by the webapp after every B2 upload/delete. `scripts/upload-iphone-pics.mjs` preserves that section and never uploads to rclone remotes named in `B2_ACCOUNTS`. If the ledger ever drifts, re-derive it from a `rclone size b2main:vault-b2main`.
+- B2 has no live "used bytes" API, so usage is tracked in the `b2` section of the unencrypted `storage-summary.json` (primary pCloud account's `vault` folder), updated by the webapp after every B2 upload/delete. `scripts/upload-iphone-pics.mjs` uses the same pool order (pCloud, then `B2_ACCOUNTS`, then any other rclone remotes) and updates the same ledger; it never treats a `B2_ACCOUNTS` bucket as a plain rclone remote. If the ledger ever drifts, re-derive it from a `rclone size b2main:vault-b2main`.
 - Objects live at `vault/<fileId>.pvlt`, thumbnails at `vault-thumbs/<fileId>.pvlt`. Manifest entries are tagged `extra: {backend: "b2", backend_account}`.
 
 ### Adding another B2 account

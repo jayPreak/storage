@@ -13,6 +13,7 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { spawn, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 function loadEnvLocal() {
   const envPath = path.resolve(process.cwd(), ".env.local");
@@ -27,6 +28,7 @@ loadEnvLocal();
 const API_BASE = "https://eapi.pcloud.com/";
 const VAULT_FOLDER_NAME = "vault";
 const SAFETY_MARGIN_BYTES = 50 * 1024 * 1024;
+const B2_SAFETY_MARGIN_BYTES = 200 * 1024 * 1024;
 const WATCH_DIR = path.join(os.homedir(), "Downloads", "iphone pics");
 const WATCHED_EXTENSIONS = new Set([".mov", ".heic", ".jpg", ".jpeg", ".png", ".mp4"]);
 const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
@@ -104,16 +106,22 @@ async function getFileLink(token, fileid) {
   return `https://${host}${json.path}`;
 }
 
-async function pickAccountForUpload(accounts, fileSizeBytes) {
-  const minFree = fileSizeBytes + SAFETY_MARGIN_BYTES;
+async function pickAccountForUpload(accounts, fileSizeBytes, b2Ledger) {
   const errors = [];
   for (const account of accounts) {
     try {
+      if (account.kind === "b2") {
+        // Same rule as lib/storageServer.ts: operator-set cap minus the
+        // storage-summary.json ledger, with a bigger margin for drift.
+        const used = b2Ledger[account.name]?.usedBytes ?? 0;
+        if (account.quotaBytes - B2_SAFETY_MARGIN_BYTES - used >= fileSizeBytes) return account;
+        continue;
+      }
       const free =
         account.kind === "rclone"
           ? await getFreeBytesRclone(account.remote)
           : await getQuota(account.token).then((q) => q.quota - q.usedquota);
-      if (free >= minFree) return account;
+      if (free >= fileSizeBytes + SAFETY_MARGIN_BYTES) return account;
     } catch (e) {
       errors.push(`${account.name}: ${e.message}`);
     }
@@ -255,6 +263,85 @@ async function getFreeBytesRclone(remote) {
 
 async function uploadCiphertextRclone(remote, filename, buffer) {
   await runRclone(["rcat", `${remote}vault/${filename}`], buffer);
+}
+
+// ---------------------------------------------------------------------------
+// Backblaze B2 (mirrors lib/b2Server.ts). Accounts come from B2_ACCOUNTS in
+// .env.local, objects go to `vault/<fileId>.pvlt` in the account's bucket,
+// and usage is tracked in the `b2` section of storage-summary.json -- the
+// same ledger the webapp reads to decide when a B2 account is full.
+// ---------------------------------------------------------------------------
+function loadB2Accounts() {
+  if (!process.env.B2_ACCOUNTS) return [];
+  return JSON.parse(process.env.B2_ACCOUNTS).map((a) => ({ ...a, kind: "b2" }));
+}
+
+const b2AuthCache = new Map();
+
+async function b2Authorize(account, force = false) {
+  const cached = b2AuthCache.get(account.name);
+  if (!force && cached) return cached;
+  const basic = Buffer.from(`${account.keyId}:${account.applicationKey}`).toString("base64");
+  const res = await fetch("https://api.backblazeb2.com/b2api/v2/b2_authorize_account", {
+    headers: { Authorization: `Basic ${basic}` },
+  });
+  if (!res.ok) throw new Error(`B2 authorize failed for ${account.name}: HTTP ${res.status}`);
+  const auth = await res.json();
+  b2AuthCache.set(account.name, auth);
+  return auth;
+}
+
+async function b2GetUploadUrl(account) {
+  for (const force of [false, true]) {
+    const auth = await b2Authorize(account, force);
+    const res = await fetch(`${auth.apiUrl}/b2api/v2/b2_get_upload_url`, {
+      method: "POST",
+      headers: { Authorization: auth.authorizationToken },
+      body: JSON.stringify({ bucketId: account.bucketId }),
+    });
+    if (res.status === 401 && !force) continue;
+    if (!res.ok) throw new Error(`B2 get_upload_url failed for ${account.name}: HTTP ${res.status}`);
+    return res.json();
+  }
+}
+
+async function uploadCiphertextB2(account, filename, buffer) {
+  const sha1 = createHash("sha1").update(buffer).digest("hex");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const { uploadUrl, authorizationToken } = await b2GetUploadUrl(account);
+    const res = await fetch(uploadUrl, {
+      method: "POST",
+      headers: {
+        Authorization: authorizationToken,
+        "X-Bz-File-Name": encodeURIComponent(`vault/${filename}`).replace(/%2F/g, "/"),
+        "Content-Type": "b2/x-auto",
+        "Content-Length": String(buffer.length),
+        "X-Bz-Content-Sha1": sha1,
+      },
+      body: buffer,
+    });
+    if (res.ok) return;
+    if (attempt === 0 && (res.status === 401 || res.status === 503)) continue;
+    throw new Error(`B2 upload failed for ${filename} on ${account.name}: HTTP ${res.status}`);
+  }
+}
+
+async function readStorageSummary(primary, folderid) {
+  const fileid = await getFileidInFolder(primary.token, folderid, "storage-summary.json");
+  if (fileid === null) return {};
+  return (await fetch(await getFileLink(primary.token, fileid))).json();
+}
+
+// Read-modify-write, preserving the rest of the file; returns the updated
+// ledger so the picker sees usage from the webapp too.
+async function adjustB2Usage(primary, folderid, accountName, deltaBytes) {
+  const summary = await readStorageSummary(primary, folderid);
+  const ledger = summary.b2 ?? {};
+  const prev = ledger[accountName]?.usedBytes ?? 0;
+  ledger[accountName] = { usedBytes: Math.max(0, prev + deltaBytes), updatedAt: new Date().toISOString() };
+  summary.b2 = ledger;
+  await uploadCiphertext(primary.token, folderid, "storage-summary.json", Buffer.from(JSON.stringify(summary)));
+  return ledger;
 }
 
 // ---------------------------------------------------------------------------
@@ -508,8 +595,15 @@ async function main() {
   console.log("Checking rclone config for new/other storage accounts...");
   const rcloneRemotes = loadRcloneRemotes();
   accounts = await syncNewPcloudAccountsFromRclone(accounts, rcloneRemotes);
-  const allAccounts = [...accounts, ...otherRcloneAccounts(new Set(accounts.map((a) => a.name)), rcloneRemotes)];
-  log(`Accounts: ${allAccounts.map((a) => a.name + (a.kind === "rclone" ? " (rclone)" : "")).join(", ")}`);
+  // Same order as the webapp's picker (pCloud, then B2), with any other
+  // rclone remotes as a last resort.
+  const b2Accounts = loadB2Accounts();
+  const allAccounts = [
+    ...accounts,
+    ...b2Accounts,
+    ...otherRcloneAccounts(new Set(accounts.map((a) => a.name)), rcloneRemotes),
+  ];
+  log(`Accounts: ${allAccounts.map((a) => a.name + (a.kind === "rclone" ? " (rclone)" : a.kind === "b2" ? " (b2)" : "")).join(", ")}`);
 
   console.log("Fetching vault config + manifest from pCloud...");
   const folderid = await ensureVaultFolder(primary.token);
@@ -533,6 +627,8 @@ async function main() {
   } else {
     manifestBuf = new Uint8Array(readFileSync(path.resolve(process.cwd(), "vault-data/manifest.enc")));
   }
+
+  let b2Ledger = b2Accounts.length ? (await readStorageSummary(primary, folderid)).b2 ?? {} : {};
 
   const passphrase = await promptHidden("Vault passphrase: ");
 
@@ -598,7 +694,7 @@ async function main() {
 
     let account;
     try {
-      account = await pickAccountForUpload(allAccounts, size);
+      account = await pickAccountForUpload(allAccounts, size, b2Ledger);
     } catch (e) {
       log(`STOP: no account has room for ${filename} (${size} bytes) -- ${e.message}`);
       stoppedForQuota = true;
@@ -622,7 +718,9 @@ async function main() {
 
       const { wrap_nonce_hex, wrapped_key_hex } = await wrapFileKey(wrapKey, fileIdHex, fileKey);
 
-      if (account.kind === "rclone") {
+      if (account.kind === "b2") {
+        await uploadCiphertextB2(account, `${fileIdHex}.pvlt`, encrypted);
+      } else if (account.kind === "rclone") {
         await uploadCiphertextRclone(account.remote, `${fileIdHex}.pvlt`, encrypted);
       } else {
         const accFolderid = account.name === primary.name ? folderid : await ensureVaultFolder(account.token);
@@ -645,15 +743,30 @@ async function main() {
             added_ts: Date.now() / 1000,
             ...(capturedTs !== null ? { captured_ts: capturedTs } : {}),
             deleted: false,
+            // Same tags as app/page.tsx writes, so the gallery can open it.
             extra:
               account.kind === "rclone"
                 ? { backend: "rclone", backend_account: account.name }
-                : { pcloud_account: account.name },
+                : account.kind === "b2"
+                  ? { backend: "b2", backend_account: account.name }
+                  : { backend: "pcloud", backend_account: account.name, pcloud_account: account.name },
           },
         },
       };
       const manifestBlob = await encryptManifest(headerKey, manifest);
       await uploadCiphertext(primary.token, folderid, "manifest.enc", manifestBlob);
+
+      if (account.kind === "b2") {
+        try {
+          b2Ledger = await adjustB2Usage(primary, folderid, account.name, encrypted.length);
+        } catch (e) {
+          // Don't fail the file (it's uploaded + in the manifest); just keep
+          // the picker honest for the rest of this run.
+          const prev = b2Ledger[account.name]?.usedBytes ?? 0;
+          b2Ledger = { ...b2Ledger, [account.name]: { usedBytes: prev + encrypted.length, updatedAt: new Date().toISOString() } };
+          log(`  (B2 usage ledger update failed for ${account.name}: ${e.message})`);
+        }
+      }
 
       uploaded.push({ filename, size, account: account.name, fileIdHex });
       log(`OK: ${filename} (${size} bytes) -> ${account.name} as ${fileIdHex}.pvlt`);
@@ -697,6 +810,7 @@ async function main() {
     ...(previousB2Ledger ? { b2: previousB2Ledger } : {}),
   };
   for (const account of allAccounts) {
+    if (account.kind === "b2") continue; // tracked in the `b2` ledger instead
     try {
       if (account.kind === "rclone") {
         const out = await runRclone(["about", account.remote, "--json"]);
@@ -713,13 +827,13 @@ async function main() {
     }
   }
   await uploadCiphertext(primary.token, folderid, "storage-summary.json", Buffer.from(JSON.stringify(storageSummary)));
-  log(`Storage summary written for ${storageSummary.accounts.length}/${allAccounts.length} accounts -- the webapp reads this for the combined total.`);
+  log(`Storage summary written for ${storageSummary.accounts.length}/${allAccounts.length - b2Accounts.length} non-B2 accounts -- the webapp reads this for the combined total.`);
 
   log("\n=== SUMMARY ===");
   log(`Uploaded: ${uploaded.length}`);
   log(`Skipped (already present / empty): ${skipped.length}`);
   log(`Failed: ${failed.length}`);
-  if (stoppedForQuota) log(`Stopped early: all configured pCloud accounts are full.`);
+  if (stoppedForQuota) log(`Stopped early: all configured storage accounts are full.`);
   log(`\nFull uploaded list:`);
   for (const u of uploaded) log(`  ${u.filename} (${u.size} bytes) -> ${u.account}`);
   if (failed.length) {
