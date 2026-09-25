@@ -72,13 +72,13 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "ffmpeg binary not available" }, { status: 500 });
   }
 
-  let body: { file_id_hex?: string; file_key_hex?: string; account?: string };
+  let body: { file_id_hex?: string; file_key_hex?: string; account?: string; backend?: "pcloud" | "b2" };
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
   }
-  const { file_id_hex, file_key_hex, account } = body;
+  const { file_id_hex, file_key_hex, account, backend } = body;
 
   if (!file_id_hex || !isValidFileIdHex(file_id_hex)) {
     return NextResponse.json({ error: "invalid file id" }, { status: 400 });
@@ -92,7 +92,7 @@ export async function POST(req: Request) {
   const outPath = path.join(dir, "out.mp4");
 
   try {
-    const ciphertext = await fetchObjectCiphertext(file_id_hex, account);
+    const ciphertext = await fetchObjectCiphertext(file_id_hex, account, backend === "b2" ? "b2" : "pcloud");
     const fileKey = Buffer.from(file_key_hex, "hex");
     const { plaintext } = decryptPvltObject(ciphertext, fileKey, file_id_hex);
 

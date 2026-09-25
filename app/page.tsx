@@ -18,6 +18,7 @@ import {
 } from "@/lib/vaultCrypto";
 import { convertHeicToJpeg, canDecodeNatively } from "@/lib/heicConvert";
 import { createLimiter } from "@/lib/limiter";
+import { resolveBackend } from "@/lib/storageBackend";
 import { extractCapturedTs } from "@/lib/captureDate";
 import { getCachedThumb, putCachedThumb } from "@/lib/thumbCache";
 import { getCachedVideo, putCachedVideo } from "@/lib/videoCache";
@@ -163,9 +164,16 @@ const SERVER_THUMB_TIMEOUT_MS = 60_000;
 const cloudDeleteLimiter = createLimiter(4);
 
 function accountQs(entry: ManifestEntry): string {
-  return entry.extra?.pcloud_account
-    ? `?account=${encodeURIComponent(String(entry.extra.pcloud_account))}`
+  const ref = resolveBackend(entry.extra);
+  return ref
+    ? `?backend=${ref.backend}&account=${encodeURIComponent(ref.account)}`
     : "";
+}
+
+// Same backend/account routing as accountQs(), for JSON request bodies.
+function backendBody(entry: ManifestEntry): { backend?: string; account?: string } {
+  const ref = resolveBackend(entry.extra);
+  return ref ? { backend: ref.backend, account: ref.account } : {};
 }
 
 function isHeicEntry(mime: string, filename: string): boolean {
@@ -560,7 +568,7 @@ export default function Home() {
 
   // Entries whose object came back 404 are only flagged here -- a 404 can
   // mean the file is genuinely gone, but it can just as easily mean the
-  // pCloud account that holds it dropped out of PCLOUD_ACCOUNTS while the
+  // account that holds it dropped out of PCLOUD_ACCOUNTS/B2_ACCOUNTS while the
   // file is still sitting there untouched. Silently auto-trashing on every
   // such 404 during ordinary browsing/thumbnailing is too destructive a
   // default, so this just tracks candidates for the user to review and
@@ -730,7 +738,7 @@ export default function Home() {
               body: JSON.stringify({
                 file_id_hex: entry.file_id_hex,
                 file_key_hex: bytesToHex(fileKey),
-                account: entry.extra?.pcloud_account,
+                ...backendBody(entry),
               }),
             });
             if (!transcodeRes.ok) {
@@ -848,7 +856,7 @@ export default function Home() {
         body: JSON.stringify({
           file_id_hex: entry.file_id_hex,
           file_key_hex: bytesToHex(fileKey),
-          account: entry.extra?.pcloud_account,
+          ...backendBody(entry),
           is_video: isVideo,
         }),
         signal: AbortSignal.timeout(SERVER_THUMB_TIMEOUT_MS),
@@ -980,7 +988,7 @@ export default function Home() {
           { method: "POST", body: encrypted as BodyInit }
         );
         if (!uploadRes.ok) throw new Error(`upload failed for ${file.name}`);
-        const { account } = (await uploadRes.json()) as { account: string };
+        const { backend, account } = (await uploadRes.json()) as { backend: "pcloud" | "b2"; account: string };
 
         const entry: ManifestEntry = {
           file_id_hex: fileIdHex,
@@ -993,7 +1001,12 @@ export default function Home() {
           added_ts: Date.now() / 1000,
           ...(capturedTs !== null ? { captured_ts: capturedTs } : {}),
           deleted: false,
-          extra: { pcloud_account: account },
+          // pcloud_account kept on pCloud entries so older readers
+          // (scripts/backfill-captured-dates.mjs) still find the object.
+          extra:
+            backend === "pcloud"
+              ? { backend, backend_account: account, pcloud_account: account }
+              : { backend, backend_account: account },
         };
 
         manifest = {

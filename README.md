@@ -63,7 +63,26 @@ Uploads automatically overflow to the next account in the array once the current
 3. Append `{"name":"pcloud2","token":"..."}` to the `PCLOUD_ACCOUNTS` JSON array (order = fill priority).
 4. Update the Vercel env var (`vercel env add PCLOUD_ACCOUNTS production` again, or via the dashboard) and update `webapp/.env.local` for local dev.
 
-No code changes are needed -- `pickAccountForUpload` in `lib/pcloudServer.ts` iterates whatever accounts are configured.
+No code changes are needed -- `pickAccountForUpload` in `lib/storageServer.ts` iterates whatever accounts are configured.
+
+## Backblaze B2 accounts (`B2_ACCOUNTS`)
+
+B2 buckets join the same upload pool: `pickAccountForUpload` (`lib/storageServer.ts`) tries every pCloud account first, then every B2 account, each in env-var order, first fit wins. Configure via a JSON array:
+
+```
+B2_ACCOUNTS=[{"name":"b2main","keyId":"...","applicationKey":"...","bucketId":"...","bucketName":"vault-b2main","quotaBytes":10000000000}]
+```
+
+- `quotaBytes` is your self-imposed cap (B2 has no quota API). A 200MB safety margin is kept below it.
+- B2 has no live "used bytes" API, so usage is tracked in the `b2` section of the unencrypted `storage-summary.json` (primary pCloud account's `vault` folder), updated by the webapp after every B2 upload/delete. `scripts/upload-iphone-pics.mjs` preserves that section and never uploads to rclone remotes named in `B2_ACCOUNTS`. If the ledger ever drifts, re-derive it from a `rclone size b2main:vault-b2main`.
+- Objects live at `vault/<fileId>.pvlt`, thumbnails at `vault-thumbs/<fileId>.pvlt`. Manifest entries are tagged `extra: {backend: "b2", backend_account}`.
+
+### Adding another B2 account
+
+1. Backblaze console: create a bucket (Private, no default encryption/object lock) and a bucket-scoped Application Key.
+2. Optional: `rclone config` a remote for it and `rclone lsd <name>:` as a sanity check.
+3. Get its `bucketId` from the console (or `b2_list_buckets`).
+4. Append `{name, keyId, applicationKey, bucketId, bucketName, quotaBytes}` to `B2_ACCOUNTS` in Vercel (Sensitive) and `.env.local`. The next deploy picks it up.
 
 ## Bulk-importing local photos/videos (`scripts/upload-iphone-pics.mjs`)
 

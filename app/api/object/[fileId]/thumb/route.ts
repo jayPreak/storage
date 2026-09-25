@@ -7,16 +7,29 @@
 import { NextResponse } from "next/server";
 import { isValidFileIdHex } from "@/lib/vaultPaths";
 import { accountByName, getFileLinkByPath, primaryAccount, uploadToPath } from "@/lib/pcloudServer";
+import * as b2 from "@/lib/b2Server";
+import { adjustB2UsageBestEffort, parseBackendParam, type ResolvedAccount } from "@/lib/storageServer";
 
 const THUMBS_FOLDER = "/vault-thumbs";
 const MAX_THUMB_BYTES = 2 * 1024 * 1024;
 
 // Thumbnails sit in the same account as their original (falling back to the
-// primary account for legacy entries with no recorded account) so GET and
-// PUT always agree on where to look.
-function resolveAccount(req: Request) {
-  const name = new URL(req.url).searchParams.get("account");
-  return name ? accountByName(name) : primaryAccount();
+// primary pCloud account for legacy entries with no recorded account) so
+// GET and PUT always agree on where to look. B2 thumbs live under
+// b2.THUMBS_PREFIX in the original's bucket.
+function resolveAccount(req: Request): ResolvedAccount | null {
+  const searchParams = new URL(req.url).searchParams;
+  const name = searchParams.get("account");
+  const backend = parseBackendParam(searchParams.get("backend"));
+  if (backend === "b2") {
+    const account = name ? b2.accountByName(name) : undefined;
+    return account ? { backend, account } : null;
+  }
+  if (backend === "pcloud") {
+    const account = name ? accountByName(name) : primaryAccount();
+    return account ? { backend, account } : null;
+  }
+  return null;
 }
 
 export async function GET(req: Request, { params }: { params: Promise<{ fileId: string }> }) {
@@ -27,12 +40,16 @@ export async function GET(req: Request, { params }: { params: Promise<{ fileId: 
   const notFound = () =>
     NextResponse.json({ error: "no stored thumbnail" }, { status: 404, headers: { "Cache-Control": "no-store" } });
   try {
-    const account = resolveAccount(req);
-    if (!account) return notFound();
-    const link = await getFileLinkByPath(account.token, `${THUMBS_FOLDER}/${fileId}.pvlt`);
-    if (!link) return notFound();
-    const upstream = await fetch(link);
-    if (!upstream.ok || !upstream.body) return notFound();
+    const resolved = resolveAccount(req);
+    if (!resolved) return notFound();
+    let upstream: Response | null;
+    if (resolved.backend === "b2") {
+      upstream = await b2.downloadFile(resolved.account, `${b2.THUMBS_PREFIX}${fileId}.pvlt`);
+    } else {
+      const link = await getFileLinkByPath(resolved.account.token, `${THUMBS_FOLDER}/${fileId}.pvlt`);
+      upstream = link ? await fetch(link) : null;
+    }
+    if (!upstream?.ok || !upstream.body) return notFound();
     return new NextResponse(upstream.body, {
       status: 200,
       headers: {
@@ -53,8 +70,8 @@ export async function PUT(req: Request, { params }: { params: Promise<{ fileId: 
   if (!isValidFileIdHex(fileId)) {
     return NextResponse.json({ error: "invalid file id" }, { status: 400 });
   }
-  const account = resolveAccount(req);
-  if (!account) {
+  const resolved = resolveAccount(req);
+  if (!resolved) {
     return NextResponse.json({ error: "unknown account" }, { status: 400 });
   }
   const body = new Uint8Array(await req.arrayBuffer());
@@ -62,7 +79,12 @@ export async function PUT(req: Request, { params }: { params: Promise<{ fileId: 
     return NextResponse.json({ error: "thumbnail too large" }, { status: 413 });
   }
   try {
-    await uploadToPath(account.token, THUMBS_FOLDER, `${fileId}.pvlt`, body);
+    if (resolved.backend === "b2") {
+      await b2.uploadFile(resolved.account, `${b2.THUMBS_PREFIX}${fileId}.pvlt`, body);
+      await adjustB2UsageBestEffort(resolved.account.name, body.length);
+    } else {
+      await uploadToPath(resolved.account.token, THUMBS_FOLDER, `${fileId}.pvlt`, body);
+    }
     return NextResponse.json({ ok: true });
   } catch (e) {
     return NextResponse.json(

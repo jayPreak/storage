@@ -11,6 +11,7 @@ import {
   getFileidInFolder,
   getFileLink,
 } from "@/lib/pcloudServer";
+import * as b2 from "@/lib/b2Server";
 
 const MAGIC = Buffer.from("PVLT");
 const NONCE_LEN = 12;
@@ -81,8 +82,18 @@ export function decryptPvltObject(
   return { metadata, plaintext: Buffer.concat(chunks) };
 }
 
-export async function fetchObjectCiphertext(fileIdHex: string, accountName?: string): Promise<Buffer> {
+export async function fetchObjectCiphertext(
+  fileIdHex: string,
+  accountName?: string,
+  backend: "pcloud" | "b2" = "pcloud"
+): Promise<Buffer> {
   const filename = `${fileIdHex}.pvlt`;
+  if (backend === "b2") {
+    const b2Account = accountName ? b2.accountByName(accountName) : undefined;
+    const buf = b2Account ? await b2.fetchObjectCiphertext(b2Account, filename) : null;
+    if (!buf) throw new Error("object not found");
+    return buf;
+  }
   const account = accountName ? accountByName(accountName) : await findAccountHoldingFile(filename);
   if (!account) throw new Error("object not found");
 

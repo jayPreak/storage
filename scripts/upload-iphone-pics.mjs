@@ -208,9 +208,21 @@ async function syncNewPcloudAccountsFromRclone(accounts, remotes) {
 // Every other rclone remote (mega1, gdrive1, onedrive1, ...) becomes a
 // generic backend account: not browsable from the webapp gallery yet, just
 // extra backup capacity the vault can spill into once pCloud is full.
+// Remotes that are also webapp B2 accounts (B2_ACCOUNTS) are skipped: the
+// webapp owns those buckets and tracks their usage in the storage-summary
+// B2 ledger, which rclone uploads from here would silently bypass.
+function b2AccountNames() {
+  try {
+    return new Set(JSON.parse(process.env.B2_ACCOUNTS ?? "[]").map((a) => a.name));
+  } catch {
+    return new Set();
+  }
+}
+
 function otherRcloneAccounts(pcloudAccountNames, remotes) {
+  const b2Names = b2AccountNames();
   return Object.keys(remotes)
-    .filter((name) => !pcloudAccountNames.has(name))
+    .filter((name) => !pcloudAccountNames.has(name) && !b2Names.has(name))
     .map((name) => ({ name, kind: "rclone", remote: `${name}:` }));
 }
 
@@ -670,7 +682,20 @@ async function main() {
   log(`Verified ${verifiedCount}/${uploaded.length} uploaded entries present in the re-fetched pCloud manifest (this is exactly what the webapp UI reads on unlock).`);
 
   log("\n--- Writing combined storage summary (all accounts, incl. non-pCloud) ---");
-  const storageSummary = { updated_ts: Date.now() / 1000, accounts: [] };
+  // Preserve the webapp's B2 usage ledger (`b2` section) -- this script
+  // only owns `accounts`.
+  let previousB2Ledger;
+  try {
+    const prevId = await getFileidInFolder(primary.token, folderid, "storage-summary.json");
+    if (prevId !== null) previousB2Ledger = (await (await fetch(await getFileLink(primary.token, prevId))).json()).b2;
+  } catch (e) {
+    log(`  (couldn't read existing storage summary: ${e.message})`);
+  }
+  const storageSummary = {
+    updated_ts: Date.now() / 1000,
+    accounts: [],
+    ...(previousB2Ledger ? { b2: previousB2Ledger } : {}),
+  };
   for (const account of allAccounts) {
     try {
       if (account.kind === "rclone") {
