@@ -35,6 +35,27 @@ started, so future work doesn't have to re-diff the two.
 - **Floating selection bar — Delete** — real, sets `deleted: true` on
   selected entries and persists the manifest (i.e. moves to Trash, doesn't
   erase anything remotely).
+- **Photos / Videos views** — sidebar + mobile tabs, filtered client-side
+  by MIME type / extension (`isVideoEntry` in `app/page.tsx`).
+- **Multi-select gestures** (`app/useGridGestures.ts`):
+  - Mouse: drag on the grid draws a marquee (hold Shift/Cmd/Ctrl to add to
+    the selection); auto-scrolls near the edges.
+  - Shift-click selects a range from the last clicked tile; Cmd/Ctrl-click
+    toggles; once anything is selected a plain click toggles too.
+  - Touch: long-press a tile, then drag to select the range (starting on a
+    selected tile deselects instead).
+  - Click a day header to select/deselect that whole day.
+  - Esc clears, Cmd/Ctrl+A selects all in the current grid.
+  - Pinch (touch) / Ctrl+scroll (trackpad) zooms the grid: 2–6 columns on
+    phones, S–XL on desktop.
+- **Empty Trash** — toolbar button in Trash; deletes all blobs (4 at a
+  time) then drops the entries in one manifest save. Destructive actions go
+  through an in-app confirm dialog (bottom sheet on phones) instead of
+  `window.confirm`.
+- **Mobile chrome** — selecting swaps the header to "N selected / Select
+  all" and the bottom tabs to a Download/Delete (or Restore/Delete forever)
+  action bar; icon tabs with a Trash badge; edge-to-edge square tiles;
+  sticky day headers; icon-only lightbox actions, no arrows on touch.
 - **Restore from Trash** — real, per-item (in the lightbox, when viewing
   Trash) and bulk (selection bar).
 
@@ -72,8 +93,6 @@ back here, rather than silently doing nothing:
 
 ## Not started
 
-- **Drag-to-select / marquee selection** — design doesn't show this either,
-  but common in this pattern; not present in either version.
 - Any multi-user / sharing infra beyond the single-passphrase model.
 
 ## Verification notes for whoever picks this up next

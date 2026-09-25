@@ -21,6 +21,7 @@ import { createLimiter } from "@/lib/limiter";
 import { extractCapturedTs } from "@/lib/captureDate";
 import { getCachedThumb, putCachedThumb } from "@/lib/thumbCache";
 import { getCachedVideo, putCachedVideo } from "@/lib/videoCache";
+import { useGridGestures } from "./useGridGestures";
 import styles from "./page.module.css";
 
 type UnlockedState = {
@@ -40,12 +41,57 @@ type OpenState = {
 };
 
 type Zoom = "S" | "M" | "L" | "XL";
-type View = "library" | "trash" | "folders";
+type View = "library" | "photos" | "videos" | "trash" | "folders";
 type Theme = "dark" | "light";
 type FolderPath = { year?: number; month?: number; day?: number };
 
 function capturedOf(entry: ManifestEntry): number {
   return entry.captured_ts ?? entry.added_ts;
+}
+
+// Module-level so the React compiler's purity lint doesn't mistake the
+// async handler that calls it for render code.
+function nowSec(): number {
+  return Date.now() / 1000;
+}
+
+function isVideoEntry(entry: ManifestEntry): boolean {
+  return (
+    entry.mime_type.includes("quicktime") ||
+    entry.mime_type.startsWith("video/") ||
+    /\.(mov|mp4|m4v|webm)$/i.test(entry.filename)
+  );
+}
+
+const VIEW_TITLES: Record<View, string> = {
+  library: "Library",
+  photos: "Photos",
+  videos: "Videos",
+  trash: "Trash",
+  folders: "Folders",
+};
+
+// Small inline stroke icons for nav + mobile chrome (inherit currentColor).
+function Icon({ name, size = 18 }: { name: string; size?: number }) {
+  const paths: Record<string, React.ReactNode> = {
+    library: <><rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /></>,
+    photos: <><rect x="3" y="4" width="18" height="16" rx="2.5" /><circle cx="8.5" cy="9.5" r="1.8" /><path d="M21 16l-5-5-8 9" /></>,
+    videos: <><rect x="3" y="5" width="13" height="14" rx="2.5" /><path d="M16 10l5-3v10l-5-3z" /></>,
+    folders: <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z" />,
+    trash: <><path d="M4 7h16M9 7V4.5h6V7M6 7l1 13h10l1-13" /></>,
+    close: <path d="M6 6l12 12M18 6L6 18" />,
+    download: <><path d="M12 4v11M7 10l5 5 5-5M5 20h14" /></>,
+    restore: <><path d="M4 12a8 8 0 108-8 8 8 0 00-6 2.7L4 9" /><path d="M4 4v5h5" /></>,
+    upload: <><path d="M12 20V9M7 14l5-5 5 5M5 4h14" /></>,
+    check: <path d="M5 12.5l4.5 4.5L19 7.5" />,
+    sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></>,
+    moon: <path d="M20 14.5A8 8 0 019.5 4a8 8 0 1010.5 10.5z" />,
+  };
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      {paths[name]}
+    </svg>
+  );
 }
 
 const THUMB_SIZE = 240;
@@ -113,6 +159,8 @@ const photoThumbLimiter = createLimiter(3);
 const videoThumbLimiter = createLimiter(1);
 const clientDecodeLimiter = createLimiter(1);
 const SERVER_THUMB_TIMEOUT_MS = 60_000;
+// Permanent deletes (e.g. emptying a big Trash) run a few at a time.
+const cloudDeleteLimiter = createLimiter(4);
 
 function accountQs(entry: ManifestEntry): string {
   return entry.extra?.pcloud_account
@@ -202,12 +250,12 @@ type TileProps = {
   thumbUrl: string | undefined;
   selected: boolean;
   loading: boolean;
-  onOpen: (entry: ManifestEntry) => void;
-  onToggle: (id: string) => void;
+  onTileClick: (entry: ManifestEntry, e: React.MouseEvent) => void;
+  onCheckClick: (entry: ManifestEntry, e: React.MouseEvent) => void;
   onNearChange: (entry: ManifestEntry, near: boolean, el: Element) => void;
 };
 
-function Tile({ entry, thumbUrl, selected, loading, onOpen, onToggle, onNearChange }: TileProps) {
+function Tile({ entry, thumbUrl, selected, loading, onTileClick, onCheckClick, onNearChange }: TileProps) {
   const ref = useRef<HTMLDivElement>(null);
   const [near, setNear] = useState(false);
   const onNearRef = useRef(onNearChange);
@@ -224,12 +272,13 @@ function Tile({ entry, thumbUrl, selected, loading, onOpen, onToggle, onNearChan
   }, [entry]);
 
   const isHeic = isHeicEntry(entry.mime_type, entry.filename);
-  const isVideo = entry.mime_type.includes("quicktime") || entry.mime_type.startsWith("video/");
+  const isVideo = isVideoEntry(entry);
   return (
     <div
       ref={ref}
+      data-tile-id={entry.file_id_hex}
       className={`${styles.tile} ${selected ? styles.tileSelected : ""}`}
-      onClick={() => onOpen(entry)}
+      onClick={(e) => onTileClick(entry, e)}
     >
       {/* Only keep the <img> mounted while the tile is near the viewport,
           so thousands of decoded thumbnails aren't all held in memory at
@@ -237,7 +286,7 @@ function Tile({ entry, thumbUrl, selected, loading, onOpen, onToggle, onNearChan
           desktop browsers would). */}
       {thumbUrl && near ? (
         // eslint-disable-next-line @next/next/no-img-element
-        <img src={thumbUrl} alt={entry.filename} className={styles.thumbImg} decoding="async" />
+        <img src={thumbUrl} alt={entry.filename} className={styles.thumbImg} decoding="async" draggable={false} />
       ) : (
         <div className={styles.tilePlaceholder}>
           <div className={styles.tileIcon}>{isVideo ? "\u{1F3A5}" : "\u{1F5BC}️"}</div>
@@ -255,12 +304,13 @@ function Tile({ entry, thumbUrl, selected, loading, onOpen, onToggle, onNearChan
         data-selected={selected}
         onClick={(e) => {
           e.stopPropagation();
-          onToggle(entry.file_id_hex);
+          onCheckClick(entry, e);
         }}
         aria-label={selected ? "Deselect" : "Select"}
       >
-        <span className={styles.checkBox}>{selected && "✓"}</span>
+        <span className={styles.checkBox}>{selected && <Icon name="check" size={13} />}</span>
       </button>
+      {isVideo && <div className={styles.videoBadge}>▶</div>}
       <div className={styles.lockBadge}>🔒</div>
       {loading && (
         <div className={styles.tileLoading}>
@@ -303,6 +353,31 @@ export default function Home() {
   const [isMobile, setIsMobile] = useState(false);
   const [storage, setStorage] = useState<{ used: number; quota: number; grandUsed: number; grandQuota: number } | null>(null);
   const [notice, setNotice] = useState<string>("");
+  // Explicit "Select" mode (mobile toolbar button / long-press). On top of
+  // that, having anything selected always counts as selecting, so a plain
+  // click on a tile toggles it instead of opening it.
+  const [selectMode, setSelectMode] = useState(false);
+  const [mobileCols, setMobileCols] = useState<number>(() => {
+    if (typeof window === "undefined") return 4;
+    const saved = Number(window.localStorage.getItem("vault-mobile-cols"));
+    return saved >= 2 && saved <= 6 ? saved : 4;
+  });
+  const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
+  const mainRef = useRef<HTMLDivElement>(null);
+  const [confirmState, setConfirmState] = useState<
+    | { title: string; body: string; confirmLabel: string; danger: boolean; resolve: (ok: boolean) => void }
+    | null
+  >(null);
+
+  function askConfirm(opts: { title: string; body: string; confirmLabel: string; danger?: boolean }) {
+    return new Promise<boolean>((resolve) =>
+      setConfirmState({ ...opts, danger: opts.danger ?? false, resolve })
+    );
+  }
+  function settleConfirm(ok: boolean) {
+    confirmState?.resolve(ok);
+    setConfirmState(null);
+  }
 
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 860);
@@ -317,6 +392,17 @@ export default function Home() {
   useEffect(() => {
     window.localStorage.setItem("vault-zoom", zoom);
   }, [zoom]);
+  useEffect(() => {
+    window.localStorage.setItem("vault-mobile-cols", String(mobileCols));
+  }, [mobileCols]);
+
+  function changeView(next: View) {
+    setView(next);
+    setFolderPath({});
+    setSelectedIds({});
+    setSelectMode(false);
+    setSelectionAnchor(null);
+  }
 
   useEffect(() => {
     if (!unlocked) return;
@@ -334,6 +420,75 @@ export default function Home() {
       })
       .catch(() => {});
   }, [unlocked]);
+
+  const allEntries = unlocked ? Object.values(unlocked.manifest.entries) : [];
+  const libraryEntries = allEntries.filter((e) => !e.deleted);
+  const trashEntries = allEntries.filter((e) => e.deleted);
+  const videoEntries = libraryEntries.filter(isVideoEntry);
+  const photoEntries = libraryEntries.filter((e) => !isVideoEntry(e));
+  const baseEntries =
+    view === "trash"
+      ? trashEntries
+      : view === "photos"
+      ? photoEntries
+      : view === "videos"
+      ? videoEntries
+      : libraryEntries;
+  const searchLower = search.trim().toLowerCase();
+  const visibleEntries = (searchLower
+    ? baseEntries.filter((e) => e.filename.toLowerCase().includes(searchLower))
+    : baseEntries
+  ).sort((a, b) => capturedOf(b) - capturedOf(a));
+
+
+  // Group visible entries by day, preserving desc-sorted order.
+  const dateGroups: { label: string; entries: ManifestEntry[] }[] = [];
+  for (const entry of visibleEntries) {
+    const label = dateGroupLabel(capturedOf(entry));
+    const last = dateGroups[dateGroups.length - 1];
+    if (last && last.label === label) last.entries.push(entry);
+    else dateGroups.push({ label, entries: [entry] });
+  }
+
+  // Folders view: Year -> Month -> Day, computed from capture date.
+  const folderYears = new Map<number, Map<number, Map<number, ManifestEntry[]>>>();
+  if (view === "folders") {
+    for (const entry of libraryEntries) {
+      const d = new Date(capturedOf(entry) * 1000);
+      const y = d.getFullYear();
+      const m = d.getMonth();
+      const day = d.getDate();
+      if (!folderYears.has(y)) folderYears.set(y, new Map());
+      const months = folderYears.get(y)!;
+      if (!months.has(m)) months.set(m, new Map());
+      const days = months.get(m)!;
+      if (!days.has(day)) days.set(day, []);
+      days.get(day)!.push(entry);
+    }
+  }
+  const folderYearsSorted = Array.from(folderYears.keys()).sort((a, b) => b - a);
+  const folderMonths = folderPath.year !== undefined ? folderYears.get(folderPath.year) : undefined;
+  const folderDays =
+    folderPath.year !== undefined && folderPath.month !== undefined
+      ? folderMonths?.get(folderPath.month)
+      : undefined;
+  const folderDayEntries =
+    folderPath.year !== undefined && folderPath.month !== undefined && folderPath.day !== undefined
+      ? (folderDays?.get(folderPath.day) ?? []).sort((a, b) => capturedOf(b) - capturedOf(a))
+      : undefined;
+  const MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+  ];
+
+  const selectedCount = Object.keys(selectedIds).length;
+  const gridEntries = view === "folders" ? (folderDayEntries ?? []) : visibleEntries;
+  const selecting = selectMode || selectedCount > 0;
+  const allGridSelected = gridEntries.length > 0 && gridEntries.every((e) => selectedIds[e.file_id_hex]);
+  const gridColumns = isMobile
+    ? `repeat(${mobileCols}, 1fr)`
+    : `repeat(auto-fill, minmax(${ZOOM_PX[zoom]}px, 1fr))`;
+
 
   function flashNotice(msg: string) {
     setNotice(msg);
@@ -419,13 +574,12 @@ export default function Home() {
     if (!unlocked) return;
     const ids = Object.keys(missingIds);
     if (ids.length === 0) return;
-    if (
-      !window.confirm(
-        `Move ${ids.length} item(s) to trash? Their encrypted files couldn't be found under any currently configured cloud storage account -- double-check your account config if this number looks too high before confirming.`
-      )
-    ) {
-      return;
-    }
+    const ok = await askConfirm({
+      title: `Move ${ids.length} item${ids.length === 1 ? "" : "s"} to Trash?`,
+      body: "Their encrypted files couldn't be found under any currently configured cloud storage account. Double-check your account config if this number looks too high.",
+      confirmLabel: "Move to Trash",
+    });
+    if (!ok) return;
     const nextEntries = { ...unlocked.manifest.entries };
     let changed = false;
     for (const id of ids) {
@@ -773,11 +927,11 @@ export default function Home() {
 
   function openByOffset(offset: number) {
     if (!open) return;
-    const idx = visibleEntries.findIndex((e) => e.file_id_hex === open.entry.file_id_hex);
+    const idx = gridEntries.findIndex((e) => e.file_id_hex === open.entry.file_id_hex);
     if (idx === -1) return;
     const nextIdx = idx + offset;
-    if (nextIdx < 0 || nextIdx >= visibleEntries.length) return;
-    handleOpen(visibleEntries[nextIdx]);
+    if (nextIdx < 0 || nextIdx >= gridEntries.length) return;
+    handleOpen(gridEntries[nextIdx]);
   }
 
   async function handleUpload(files: FileList | null) {
@@ -864,6 +1018,7 @@ export default function Home() {
 
   // ---- Selection ----
   function toggleSelect(id: string) {
+    setSelectionAnchor(id);
     setSelectedIds((prev) => {
       const next = { ...prev };
       if (next[id]) delete next[id];
@@ -873,6 +1028,42 @@ export default function Home() {
   }
   function clearSelection() {
     setSelectedIds({});
+    setSelectMode(false);
+    setSelectionAnchor(null);
+  }
+  // Shift-click: select everything between the last clicked tile and this
+  // one (in on-screen order), keeping whatever was already selected.
+  function selectRangeTo(id: string) {
+    const anchor = selectionAnchor;
+    const order = gridEntries.map((e) => e.file_id_hex);
+    const i = anchor ? order.indexOf(anchor) : -1;
+    const j = order.indexOf(id);
+    if (i === -1 || j === -1) return toggleSelect(id);
+    setSelectedIds((prev) => {
+      const next = { ...prev };
+      for (let k = Math.min(i, j); k <= Math.max(i, j); k++) next[order[k]] = true;
+      return next;
+    });
+  }
+  function toggleGroup(entries: ManifestEntry[]) {
+    const all = entries.every((e) => selectedIds[e.file_id_hex]);
+    setSelectedIds((prev) => {
+      const next = { ...prev };
+      for (const e of entries) {
+        if (all) delete next[e.file_id_hex];
+        else next[e.file_id_hex] = true;
+      }
+      return next;
+    });
+  }
+  function handleTileClick(entry: ManifestEntry, e: React.MouseEvent) {
+    if (e.shiftKey && selectionAnchor) selectRangeTo(entry.file_id_hex);
+    else if (e.metaKey || e.ctrlKey || selecting) toggleSelect(entry.file_id_hex);
+    else handleOpen(entry);
+  }
+  function handleCheckClick(entry: ManifestEntry, e: React.MouseEvent) {
+    if (e.shiftKey && selectionAnchor) selectRangeTo(entry.file_id_hex);
+    else toggleSelect(entry.file_id_hex);
   }
   function selectAllVisible(entries: ManifestEntry[]) {
     const next: Record<string, boolean> = {};
@@ -954,35 +1145,35 @@ export default function Home() {
     clearSelection();
   }
 
-  async function handleBulkDeletePermanently() {
-    if (!unlocked) return;
-    const ids = Object.keys(selectedIds);
-    if (ids.length === 0) return;
-    if (
-      !window.confirm(
-        `Permanently delete ${ids.length} item(s)? This also deletes the encrypted files from cloud storage and cannot be undone.`
-      )
-    ) {
-      return;
-    }
+  // Deletes the encrypted blobs from cloud storage (a few at a time) and
+  // then drops the entries from the manifest in one save.
+  async function deletePermanently(ids: string[]) {
+    if (!unlocked || ids.length === 0) return;
     setBusy(true);
-    setStatus(`Deleting ${ids.length} item(s) from cloud storage...`);
+    const progress = { done: 0 };
+    setStatus(`Deleting 0 / ${ids.length} from cloud storage...`);
     try {
       const failures: string[] = [];
-      for (const id of ids) {
-        const entry = unlocked.manifest.entries[id];
-        if (!entry) continue;
-        try {
-          const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs(entry)}`, { method: "DELETE" });
-          if (!res.ok) failures.push(entry.filename);
-        } catch {
-          failures.push(entry.filename);
-        }
-      }
+      await Promise.all(
+        ids.map((id) =>
+          cloudDeleteLimiter(async () => {
+            const entry = unlocked.manifest.entries[id];
+            if (!entry) return;
+            try {
+              const res = await fetch(`/api/object/${entry.file_id_hex}${accountQs(entry)}`, { method: "DELETE" });
+              if (!res.ok) failures.push(entry.filename);
+            } catch {
+              failures.push(entry.filename);
+            }
+            progress.done++;
+            setStatus(`Deleting ${progress.done} / ${ids.length} from cloud storage...`);
+          })
+        )
+      );
 
       const nextEntries = { ...unlocked.manifest.entries };
       for (const id of ids) delete nextEntries[id];
-      await persistManifest({ ...unlocked.manifest, updated_ts: Date.now() / 1000, entries: nextEntries });
+      await persistManifest({ ...unlocked.manifest, updated_ts: nowSec(), entries: nextEntries });
       clearSelection();
       setStatus(
         failures.length
@@ -996,15 +1187,29 @@ export default function Home() {
     }
   }
 
-  const allEntries = unlocked ? Object.values(unlocked.manifest.entries) : [];
-  const libraryEntries = allEntries.filter((e) => !e.deleted);
-  const trashEntries = allEntries.filter((e) => e.deleted);
-  const baseEntries = view === "trash" ? trashEntries : libraryEntries;
-  const searchLower = search.trim().toLowerCase();
-  const visibleEntries = (searchLower
-    ? baseEntries.filter((e) => e.filename.toLowerCase().includes(searchLower))
-    : baseEntries
-  ).sort((a, b) => capturedOf(b) - capturedOf(a));
+  async function handleBulkDeletePermanently() {
+    const ids = Object.keys(selectedIds);
+    if (ids.length === 0) return;
+    const ok = await askConfirm({
+      title: `Delete ${ids.length} item${ids.length === 1 ? "" : "s"} forever?`,
+      body: "This also deletes the encrypted files from cloud storage. It can't be undone.",
+      confirmLabel: "Delete forever",
+      danger: true,
+    });
+    if (ok) await deletePermanently(ids);
+  }
+
+  async function handleEmptyTrash() {
+    const ids = trashEntries.map((e) => e.file_id_hex);
+    if (ids.length === 0) return;
+    const ok = await askConfirm({
+      title: "Empty Trash?",
+      body: `All ${ids.length} item${ids.length === 1 ? "" : "s"} in Trash will be permanently deleted from cloud storage. This can't be undone.`,
+      confirmLabel: `Delete ${ids.length} forever`,
+      danger: true,
+    });
+    if (ok) await deletePermanently(ids);
+  }
 
   useEffect(() => {
     if (!open) return;
@@ -1033,49 +1238,42 @@ export default function Home() {
     else if (dx < -SWIPE_THRESHOLD) openByOffset(1);
   }
 
-  // Group visible entries by day, preserving desc-sorted order.
-  const dateGroups: { label: string; entries: ManifestEntry[] }[] = [];
-  for (const entry of visibleEntries) {
-    const label = dateGroupLabel(capturedOf(entry));
-    const last = dateGroups[dateGroups.length - 1];
-    if (last && last.label === label) last.entries.push(entry);
-    else dateGroups.push({ label, entries: [entry] });
-  }
-
-  // Folders view: Year -> Month -> Day, computed from capture date.
-  const folderYears = new Map<number, Map<number, Map<number, ManifestEntry[]>>>();
-  if (view === "folders") {
-    for (const entry of libraryEntries) {
-      const d = new Date(capturedOf(entry) * 1000);
-      const y = d.getFullYear();
-      const m = d.getMonth();
-      const day = d.getDate();
-      if (!folderYears.has(y)) folderYears.set(y, new Map());
-      const months = folderYears.get(y)!;
-      if (!months.has(m)) months.set(m, new Map());
-      const days = months.get(m)!;
-      if (!days.has(day)) days.set(day, []);
-      days.get(day)!.push(entry);
+  function zoomBy(dir: 1 | -1) {
+    if (isMobile) {
+      setMobileCols((c) => Math.min(6, Math.max(2, c - dir)));
+    } else {
+      const order: Zoom[] = ["S", "M", "L", "XL"];
+      setZoom((z) => order[Math.min(3, Math.max(0, order.indexOf(z) + dir))]);
     }
   }
-  const folderYearsSorted = Array.from(folderYears.keys()).sort((a, b) => b - a);
-  const folderMonths = folderPath.year !== undefined ? folderYears.get(folderPath.year) : undefined;
-  const folderDays =
-    folderPath.year !== undefined && folderPath.month !== undefined
-      ? folderMonths?.get(folderPath.month)
-      : undefined;
-  const folderDayEntries =
-    folderPath.year !== undefined && folderPath.month !== undefined && folderPath.day !== undefined
-      ? (folderDays?.get(folderPath.day) ?? []).sort((a, b) => capturedOf(b) - capturedOf(a))
-      : undefined;
-  const MONTH_NAMES = [
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-  ];
 
-  const selectedCount = Object.keys(selectedIds).length;
-  const zoomPx = ZOOM_PX[zoom];
-  const gridMinPx = isMobile ? 96 : zoomPx;
+  useGridGestures({
+    active: !!unlocked,
+    hostRef: mainRef,
+    marqueeClass: styles.marquee,
+    getOrder: () => gridEntries.map((e) => e.file_id_hex),
+    getSelected: () => selectedIds,
+    setSelected: setSelectedIds,
+    onLongPress: () => setSelectMode(true),
+    onZoom: zoomBy,
+    enabled: () => !open && !confirmState,
+  });
+
+  // Esc clears the selection, Cmd/Ctrl+A selects everything in the grid.
+  useEffect(() => {
+    if (!unlocked || open || confirmState) return;
+    function onKeyDown(e: KeyboardEvent) {
+      const t = e.target as HTMLElement;
+      if (t.closest("input, textarea")) return;
+      if (e.key === "Escape" && selecting) clearSelection();
+      else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a" && gridEntries.length > 0) {
+        e.preventDefault();
+        selectAllVisible(gridEntries);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
 
   return (
     <div
@@ -1142,27 +1340,36 @@ export default function Home() {
               </div>
 
               <nav className={styles.navList}>
-                <button
-                  className={`${styles.navItem} ${view === "library" ? styles.navItemActive : ""}`}
-                  onClick={() => setView("library")}
-                >
-                  <span className={styles.navDot} data-active={view === "library"} />
-                  <span>Library</span>
-                </button>
+                {(
+                  [
+                    ["library", libraryEntries.length],
+                    ["photos", photoEntries.length],
+                    ["videos", videoEntries.length],
+                  ] as const
+                ).map(([v, count]) => (
+                  <button
+                    key={v}
+                    className={`${styles.navItem} ${view === v ? styles.navItemActive : ""}`}
+                    onClick={() => changeView(v)}
+                  >
+                    <span className={styles.navIcon}><Icon name={v} size={16} /></span>
+                    <span>{VIEW_TITLES[v]}</span>
+                    <span className={styles.navCount}>{count}</span>
+                  </button>
+                ))}
                 <button
                   className={styles.navItem}
                   disabled
                   title="Albums aren't implemented yet -- see FEATURES.md"
                 >
-                  <span className={styles.navDot} />
+                  <span className={styles.navIcon}><Icon name="library" size={16} /></span>
                   <span>Albums</span>
-                  <span className={styles.navCount}>12</span>
                 </button>
                 <button
                   className={`${styles.navItem} ${view === "trash" ? styles.navItemActive : ""}`}
-                  onClick={() => setView("trash")}
+                  onClick={() => changeView("trash")}
                 >
-                  <span className={styles.navDot} data-active={view === "trash"} />
+                  <span className={styles.navIcon}><Icon name="trash" size={16} /></span>
                   <span>Trash</span>
                   {trashEntries.length > 0 && (
                     <span className={styles.navCount}>{trashEntries.length}</span>
@@ -1173,13 +1380,10 @@ export default function Home() {
               <div className={styles.foldersSection}>
                 <div className={styles.foldersHeading}>Folders</div>
                 <button
-                  className={styles.folderRow}
-                  onClick={() => {
-                    setView("folders");
-                    setFolderPath({});
-                  }}
+                  className={`${styles.folderRow} ${view === "folders" ? styles.navItemActive : ""}`}
+                  onClick={() => changeView("folders")}
                 >
-                  <span className={styles.folderSwatch} />
+                  <span className={styles.navIcon}><Icon name="folders" size={16} /></span>
                   <span>By date</span>
                 </button>
               </div>
@@ -1228,32 +1432,59 @@ export default function Home() {
             </div>
           )}
 
-          {/* ===== Mobile header ===== */}
-          {isMobile && (
+          {/* ===== Mobile header (swaps to a selection header while selecting) ===== */}
+          {isMobile && (selecting ? (
+            <div className={`${styles.mobileHeader} ${styles.mobileHeaderSelecting}`}>
+              <div className={styles.mobileHeaderLeft}>
+                <button className={styles.iconBtnGhost} onClick={clearSelection} aria-label="Cancel selection">
+                  <Icon name="close" />
+                </button>
+                <span className={styles.selectionTitle}>
+                  {selectedCount === 0 ? "Select items" : `${selectedCount} selected`}
+                </span>
+              </div>
+              {gridEntries.length > 0 && (
+                <button
+                  className={styles.headerTextBtn}
+                  onClick={() => (allGridSelected ? setSelectedIds({}) : selectAllVisible(gridEntries))}
+                >
+                  {allGridSelected ? "Deselect all" : "Select all"}
+                </button>
+              )}
+            </div>
+          ) : (
             <div className={styles.mobileHeader}>
               <div className={styles.mobileHeaderLeft}>
                 <span className={styles.lockIcon}>🔒</span>
                 <span className={styles.brandName}>Vault</span>
               </div>
               <div className={styles.mobileHeaderRight}>
+                {view !== "trash" && view !== "folders" && (
+                  <button
+                    className={`${styles.iconBtn} ${styles.iconBtnAccent}`}
+                    disabled={busy}
+                    onClick={() => fileInputRef.current?.click()}
+                    aria-label="Upload"
+                  >
+                    {busy ? <span className={styles.spinner} /> : <Icon name="upload" />}
+                  </button>
+                )}
                 <button
                   className={styles.iconBtn}
                   onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
                   aria-label="Toggle theme"
                 >
-                  {theme === "dark" ? "☀" : "☾"}
+                  <Icon name={theme === "dark" ? "sun" : "moon"} />
                 </button>
               </div>
             </div>
-          )}
+          ))}
 
           {/* ===== Main ===== */}
-          <div className={styles.main}>
+          <div className={styles.main} ref={mainRef}>
             <div className={styles.toolbar}>
-              <div>
-                <div className={styles.title}>
-                  {view === "trash" ? "Trash" : view === "folders" ? "Folders" : "Library"}
-                </div>
+              <div className={styles.toolbarTitleBlock}>
+                <div className={styles.title}>{VIEW_TITLES[view]}</div>
                 {view === "folders" ? (
                   <div className={styles.folderCrumbs}>
                     <button className={styles.folderCrumb} onClick={() => setFolderPath({})}>
@@ -1290,41 +1521,71 @@ export default function Home() {
                   </div>
                 ) : (
                   <div className={styles.subtitle}>
-                    {visibleEntries.length} item{visibleEntries.length === 1 ? "" : "s"} · fully encrypted
+                    {visibleEntries.length} {view === "photos" ? "photo" : view === "videos" ? "video" : "item"}
+                    {visibleEntries.length === 1 ? "" : "s"} · fully encrypted
                   </div>
                 )}
               </div>
               <div className={styles.toolbarActions}>
-                {(() => {
-                  const currentGridEntries = folderDayEntries ?? visibleEntries;
-                  if (currentGridEntries.length === 0) return null;
-                  const allSelected = selectedCount === currentGridEntries.length;
-                  return (
-                    <button
-                      className={styles.textBtn}
-                      onClick={() => (allSelected ? clearSelection() : selectAllVisible(currentGridEntries))}
-                    >
-                      {allSelected ? "Select none" : "Select all"}
-                    </button>
-                  );
-                })()}
-                {selectedCount > 0 && (
-                  <button className={styles.textBtn} onClick={clearSelection}>
-                    Cancel
-                  </button>
-                )}
-                {!isMobile && (
-                  <div className={styles.zoomGroup}>
-                    {(["S", "M", "L", "XL"] as Zoom[]).map((z) => (
+                {isMobile ? (
+                  !selecting && (
+                    <>
+                      {view === "trash" && trashEntries.length > 0 && (
+                        <button className={styles.pillBtnDanger} onClick={handleEmptyTrash} disabled={busy}>
+                          Empty Trash
+                        </button>
+                      )}
+                      {gridEntries.length > 0 && (
+                        <button className={styles.pillBtn} onClick={() => setSelectMode(true)}>
+                          Select
+                        </button>
+                      )}
+                    </>
+                  )
+                ) : (
+                  <>
+                    {gridEntries.length > 0 && (
                       <button
-                        key={z}
-                        className={`${styles.zoomBtn} ${zoom === z ? styles.zoomBtnActive : ""}`}
-                        onClick={() => setZoom(z)}
+                        className={styles.textBtn}
+                        onClick={() => (allGridSelected ? clearSelection() : selectAllVisible(gridEntries))}
+                        title="⌘A / Ctrl+A"
                       >
-                        {z}
+                        {allGridSelected ? "Select none" : "Select all"}
                       </button>
-                    ))}
-                  </div>
+                    )}
+                    {selecting && (
+                      <button className={styles.textBtn} onClick={clearSelection} title="Esc">
+                        Cancel
+                      </button>
+                    )}
+                    {view === "trash" && trashEntries.length > 0 && (
+                      <button className={`${styles.btn} ${styles.btnDanger}`} onClick={handleEmptyTrash} disabled={busy}>
+                        <Icon name="trash" size={16} /> Empty Trash
+                      </button>
+                    )}
+                    {gridEntries.length > 0 ? (
+                      <div className={styles.zoomGroup} title="Tip: pinch or Ctrl+scroll on the grid to zoom">
+                        {(["S", "M", "L", "XL"] as Zoom[]).map((z) => (
+                          <button
+                            key={z}
+                            className={`${styles.zoomBtn} ${zoom === z ? styles.zoomBtnActive : ""}`}
+                            onClick={() => setZoom(z)}
+                          >
+                            {z}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                    {view !== "trash" && view !== "folders" && (
+                      <button
+                        className={`${styles.btn} ${styles.btnPrimary}`}
+                        disabled={busy}
+                        onClick={() => fileInputRef.current?.click()}
+                      >
+                        {busy ? "Uploading..." : "↑ Upload"}
+                      </button>
+                    )}
+                  </>
                 )}
                 <input
                   ref={fileInputRef}
@@ -1336,15 +1597,6 @@ export default function Home() {
                   disabled={busy}
                   onChange={(e) => handleUpload(e.target.files)}
                 />
-                {view === "library" && (
-                  <button
-                    className={`${styles.btn} ${styles.btnPrimary}`}
-                    disabled={busy}
-                    onClick={() => fileInputRef.current?.click()}
-                  >
-                    {busy ? "Uploading..." : "↑ Upload"}
-                  </button>
-                )}
               </div>
             </div>
 
@@ -1398,7 +1650,7 @@ export default function Home() {
               folderYearsSorted.length === 0 ? (
                 <div className={styles.emptyState}>No items yet. Upload a photo or video to get started.</div>
               ) : (
-                <div className={`${styles.gridScroll} om-scroll`} data-scroll-root>
+                <div className={`${styles.gridScroll} om-scroll`} data-scroll-root data-selecting={selecting}>
                   <div className={styles.folderGrid}>
                     {folderYearsSorted.map((y) => {
                       const count = Array.from(folderYears.get(y)!.values()).reduce(
@@ -1423,7 +1675,7 @@ export default function Home() {
                 </div>
               )
             ) : view === "folders" && folderPath.month === undefined ? (
-              <div className={`${styles.gridScroll} om-scroll`} data-scroll-root>
+              <div className={`${styles.gridScroll} om-scroll`} data-scroll-root data-selecting={selecting}>
                 <div className={styles.folderGrid}>
                   {MONTH_NAMES.map((name, m) => {
                     const days = folderMonths?.get(m);
@@ -1448,7 +1700,7 @@ export default function Home() {
                 </div>
               </div>
             ) : view === "folders" && folderPath.day === undefined ? (
-              <div className={`${styles.gridScroll} om-scroll`} data-scroll-root>
+              <div className={`${styles.gridScroll} om-scroll`} data-scroll-root data-selecting={selecting}>
                 <div className={styles.folderGrid}>
                   {Array.from(folderDays?.keys() ?? [])
                     .sort((a, b) => a - b)
@@ -1474,10 +1726,10 @@ export default function Home() {
               (folderDayEntries ?? []).length === 0 ? (
                 <div className={styles.emptyState}>No items on this day.</div>
               ) : (
-                <div className={`${styles.gridScroll} om-scroll`} data-scroll-root>
+                <div className={`${styles.gridScroll} om-scroll`} data-scroll-root data-selecting={selecting}>
                   <div
                     className={styles.grid}
-                    style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${gridMinPx}px, 1fr))` }}
+                    style={{ gridTemplateColumns: gridColumns }}
                   >
                     {(folderDayEntries ?? []).map((entry) => (
                       <Tile
@@ -1486,8 +1738,8 @@ export default function Home() {
                         thumbUrl={thumbs[entry.file_id_hex]}
                         selected={!!selectedIds[entry.file_id_hex]}
                         loading={loadingIds.has(entry.file_id_hex)}
-                        onOpen={handleOpen}
-                        onToggle={toggleSelect}
+                        onTileClick={handleTileClick}
+                        onCheckClick={handleCheckClick}
                         onNearChange={handleTileNear}
                       />
                     ))}
@@ -1503,13 +1755,27 @@ export default function Home() {
                   : "No items yet. Upload a photo or video to get started."}
               </div>
             ) : (
-              <div className={`${styles.gridScroll} om-scroll`} data-scroll-root>
+              <div className={`${styles.gridScroll} om-scroll`} data-scroll-root data-selecting={selecting}>
                 {dateGroups.map((group) => (
                   <div key={group.label} className={styles.dateGroup}>
-                    <div className={styles.dateLabel}>{group.label}</div>
+                    {(() => {
+                      const groupAll = group.entries.every((e) => selectedIds[e.file_id_hex]);
+                      return (
+                        <button
+                          className={styles.dateLabel}
+                          data-all={groupAll}
+                          onClick={() => toggleGroup(group.entries)}
+                          title={groupAll ? "Deselect this day" : "Select this day"}
+                        >
+                          <span className={styles.dateCheck}>{groupAll && <Icon name="check" size={11} />}</span>
+                          {group.label}
+                          <span className={styles.dateCount}>{group.entries.length}</span>
+                        </button>
+                      );
+                    })()}
                     <div
                       className={styles.grid}
-                      style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${gridMinPx}px, 1fr))` }}
+                      style={{ gridTemplateColumns: gridColumns }}
                     >
                       {group.entries.map((entry) => (
                       <Tile
@@ -1518,8 +1784,8 @@ export default function Home() {
                         thumbUrl={thumbs[entry.file_id_hex]}
                         selected={!!selectedIds[entry.file_id_hex]}
                         loading={loadingIds.has(entry.file_id_hex)}
-                        onOpen={handleOpen}
-                        onToggle={toggleSelect}
+                        onTileClick={handleTileClick}
+                        onCheckClick={handleCheckClick}
                         onNearChange={handleTileNear}
                       />
                     ))}
@@ -1530,39 +1796,68 @@ export default function Home() {
             )}
           </div>
 
-          {/* ===== Mobile bottom tabs ===== */}
-          {isMobile && (
-            <div className={styles.bottomTabs}>
-              <button
-                className={`${styles.bottomTab} ${view === "library" ? styles.bottomTabActive : ""}`}
-                onClick={() => setView("library")}
-              >
-                <span className={styles.navDot} data-active={view === "library"} />
-                Library
-              </button>
-              <button
-                className={`${styles.bottomTab} ${view === "folders" ? styles.bottomTabActive : ""}`}
-                onClick={() => {
-                  setView("folders");
-                  setFolderPath({});
-                }}
-              >
-                <span className={styles.navDot} data-active={view === "folders"} />
-                Folders
-              </button>
-              <button
-                className={`${styles.bottomTab} ${view === "trash" ? styles.bottomTabActive : ""}`}
-                onClick={() => setView("trash")}
-              >
-                <span className={styles.navDot} data-active={view === "trash"} />
-                Trash
-              </button>
+          {/* ===== Mobile bottom: tabs, or an action bar while selecting ===== */}
+          {isMobile && (selecting ? (
+            <div className={styles.bottomActions}>
+              {view === "trash" ? (
+                <>
+                  <button className={styles.bottomAction} disabled={!selectedCount || busy} onClick={handleBulkRestore}>
+                    <Icon name="restore" />
+                    Restore
+                  </button>
+                  <button
+                    className={`${styles.bottomAction} ${styles.bottomActionDanger}`}
+                    disabled={!selectedCount || busy}
+                    onClick={handleBulkDeletePermanently}
+                  >
+                    <Icon name="trash" />
+                    Delete forever
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button className={styles.bottomAction} disabled={!selectedCount || busy} onClick={handleBulkDownload}>
+                    <Icon name="download" />
+                    Download
+                  </button>
+                  <button
+                    className={`${styles.bottomAction} ${styles.bottomActionDanger}`}
+                    disabled={!selectedCount || busy}
+                    onClick={handleBulkDelete}
+                  >
+                    <Icon name="trash" />
+                    Delete
+                  </button>
+                </>
+              )}
             </div>
-          )}
+          ) : (
+            <nav className={styles.bottomTabs}>
+              {(["library", "photos", "videos", "folders", "trash"] as View[]).map((v) => (
+                <button
+                  key={v}
+                  className={`${styles.bottomTab} ${view === v ? styles.bottomTabActive : ""}`}
+                  onClick={() => changeView(v)}
+                  aria-current={view === v ? "page" : undefined}
+                >
+                  <span className={styles.bottomTabIcon}>
+                    <Icon name={v} size={22} />
+                    {v === "trash" && trashEntries.length > 0 && (
+                      <span className={styles.tabBadge}>{trashEntries.length > 99 ? "99+" : trashEntries.length}</span>
+                    )}
+                  </span>
+                  {VIEW_TITLES[v]}
+                </button>
+              ))}
+            </nav>
+          ))}
 
-          {/* ===== Floating selection bar ===== */}
-          {selectedCount > 0 && (
+          {/* ===== Floating selection bar (desktop) ===== */}
+          {!isMobile && selectedCount > 0 && (
             <div className={styles.selectionBar}>
+              <button className={styles.selectionClose} onClick={clearSelection} aria-label="Clear selection" title="Esc">
+                <Icon name="close" size={14} />
+              </button>
               <span className={styles.selectionCount}>{selectedCount} selected</span>
               <div className={styles.selectionDivider} />
               {view === "trash" ? (
@@ -1603,10 +1898,40 @@ export default function Home() {
         </div>
       )}
 
+      {confirmState && (
+        <div className={styles.confirmOverlay} onClick={() => settleConfirm(false)}>
+          <div
+            className={styles.confirmCard}
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="confirm-title"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") settleConfirm(false);
+            }}
+          >
+            <div className={styles.confirmTitle} id="confirm-title">{confirmState.title}</div>
+            <div className={styles.confirmBody}>{confirmState.body}</div>
+            <div className={styles.confirmActions}>
+              <button className={styles.btn} onClick={() => settleConfirm(false)}>
+                Cancel
+              </button>
+              <button
+                autoFocus
+                className={`${styles.btn} ${confirmState.danger ? styles.btnDangerSolid : styles.btnPrimary}`}
+                onClick={() => settleConfirm(true)}
+              >
+                {confirmState.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {open && (() => {
-        const idx = visibleEntries.findIndex((e) => e.file_id_hex === open.entry.file_id_hex);
+        const idx = gridEntries.findIndex((e) => e.file_id_hex === open.entry.file_id_hex);
         const hasPrev = idx > 0;
-        const hasNext = idx !== -1 && idx < visibleEntries.length - 1;
+        const hasNext = idx !== -1 && idx < gridEntries.length - 1;
         return (
           <div className={styles.lightboxOverlay} onClick={closeLightbox}>
             <div
@@ -1620,7 +1945,7 @@ export default function Home() {
                   <span className={styles.lightboxFilename}>{open.entry.filename}</span>
                   {idx !== -1 && (
                     <span className={styles.lightboxCounter}>
-                      {idx + 1} / {visibleEntries.length}
+                      {idx + 1} / {gridEntries.length}
                     </span>
                   )}
                 </div>
@@ -1629,19 +1954,24 @@ export default function Home() {
                     className={styles.btn}
                     onClick={handleDownload}
                     disabled={!open.downloadBlob}
+                    aria-label="Download"
                   >
-                    {"↓ Download"}
+                    <Icon name="download" size={16} />
+                    <span className={styles.btnLabel}>Download</span>
                   </button>
                   {view === "trash" ? (
                     <button
                       className={styles.btn}
                       onClick={() => handleRestore(open.entry.file_id_hex)}
+                      aria-label="Restore"
                     >
-                      Restore
+                      <Icon name="restore" size={16} />
+                      <span className={styles.btnLabel}>Restore</span>
                     </button>
                   ) : null}
-                  <button className={styles.btn} onClick={closeLightbox}>
-                    Close
+                  <button className={styles.btn} onClick={closeLightbox} aria-label="Close">
+                    <Icon name="close" size={16} />
+                    <span className={styles.btnLabel}>Close</span>
                   </button>
                 </div>
               </div>
