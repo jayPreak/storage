@@ -18,7 +18,7 @@ function loadEnvLocal() {
   const envPath = path.resolve(process.cwd(), ".env.local");
   const text = readFileSync(envPath, "utf8");
   for (const line of text.split("\n")) {
-    const m = line.match(/^([A-Z_]+)=(.*)$/);
+    const m = line.match(/^([A-Z0-9_]+)=(.*)$/);
     if (m) process.env[m[1]] = m[2];
   }
 }
