@@ -685,6 +685,7 @@ async function main() {
 
   const uploaded = [];
   const skipped = [];
+  const skippedNoRoom = [];
   const failed = [];
   let stoppedForQuota = false;
 
@@ -714,9 +715,12 @@ async function main() {
     try {
       account = await pickAccountForUpload(allAccounts, size, b2Ledger);
     } catch (e) {
-      log(`STOP: no account has room for ${filename} (${size} bytes) -- ${e.message}`);
+      // Largest-first means an early oversized file doesn't imply every
+      // later (smaller) file is also unplaceable -- skip it and keep going.
+      skippedNoRoom.push(filename);
       stoppedForQuota = true;
-      break;
+      log(`SKIP (no room): ${filename} (${size} bytes) -- ${e.message}`);
+      continue;
     }
 
     try {
@@ -850,8 +854,9 @@ async function main() {
   log("\n=== SUMMARY ===");
   log(`Uploaded: ${uploaded.length}`);
   log(`Skipped (already present / empty): ${skipped.length}`);
+  log(`Skipped (no account had room): ${skippedNoRoom.length}`);
   log(`Failed: ${failed.length}`);
-  if (stoppedForQuota) log(`Stopped early: all configured storage accounts are full.`);
+  if (stoppedForQuota) log(`Some files were too large for any account's remaining room -- see "SKIP (no room)" lines above.`);
   log(`\nFull uploaded list:`);
   for (const u of uploaded) log(`  ${u.filename} (${u.size} bytes) -> ${u.account}`);
   if (failed.length) {
