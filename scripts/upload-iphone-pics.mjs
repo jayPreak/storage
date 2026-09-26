@@ -20,7 +20,15 @@ function loadEnvLocal() {
   const text = readFileSync(envPath, "utf8");
   for (const line of text.split("\n")) {
     const m = line.match(/^([A-Z0-9_]+)=(.*)$/);
-    if (m) process.env[m[1]] = m[2];
+    if (!m) continue;
+    let value = m[2];
+    // `vercel env pull` (and this script's own rclone-sync writer) both wrap
+    // values in a single layer of quotes -- strip only the outermost pair so
+    // JSON values (e.g. PCLOUD_ACCOUNTS/B2_ACCOUNTS) parse correctly.
+    if (value.length >= 2 && ((value[0] === '"' && value.at(-1) === '"') || (value[0] === "'" && value.at(-1) === "'"))) {
+      value = value.slice(1, -1);
+    }
+    process.env[m[1]] = value;
   }
 }
 loadEnvLocal();
