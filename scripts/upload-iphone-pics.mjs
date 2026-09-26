@@ -715,11 +715,19 @@ async function main() {
     try {
       account = await pickAccountForUpload(allAccounts, size, b2Ledger);
     } catch (e) {
-      // Largest-first means an early oversized file doesn't imply every
-      // later (smaller) file is also unplaceable -- skip it and keep going.
+      // Largest-first means an oversized file doesn't imply every later
+      // (smaller) file is also unplaceable. Only stop the whole run once no
+      // account has room for even a tiny file -- i.e. everything is
+      // genuinely full, not just too small for this one file.
+      try {
+        await pickAccountForUpload(allAccounts, 1, b2Ledger);
+      } catch {
+        log(`STOP: all storage accounts are full -- ${e.message}`);
+        stoppedForQuota = true;
+        break;
+      }
       skippedNoRoom.push(filename);
-      stoppedForQuota = true;
-      log(`SKIP (no room): ${filename} (${size} bytes) -- ${e.message}`);
+      log(`SKIP (no room for this file): ${filename} (${size} bytes) -- ${e.message}`);
       continue;
     }
 
@@ -854,9 +862,9 @@ async function main() {
   log("\n=== SUMMARY ===");
   log(`Uploaded: ${uploaded.length}`);
   log(`Skipped (already present / empty): ${skipped.length}`);
-  log(`Skipped (no account had room): ${skippedNoRoom.length}`);
+  log(`Skipped (too large for remaining room, but other accounts had space): ${skippedNoRoom.length}`);
   log(`Failed: ${failed.length}`);
-  if (stoppedForQuota) log(`Some files were too large for any account's remaining room -- see "SKIP (no room)" lines above.`);
+  if (stoppedForQuota) log(`Stopped early: all configured storage accounts are full.`);
   log(`\nFull uploaded list:`);
   for (const u of uploaded) log(`  ${u.filename} (${u.size} bytes) -> ${u.account}`);
   if (failed.length) {
