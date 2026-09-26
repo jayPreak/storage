@@ -79,10 +79,68 @@ B2_ACCOUNTS=[{"name":"b2main","keyId":"...","applicationKey":"...","bucketId":".
 
 ### Adding another B2 account
 
-1. Backblaze console: create a bucket (Private, no default encryption/object lock) and a bucket-scoped Application Key.
-2. Optional: `rclone config` a remote for it and `rclone lsd <name>:` as a sanity check.
-3. Get its `bucketId` from the console (or `b2_list_buckets`).
-4. Append `{name, keyId, applicationKey, bucketId, bucketName, quotaBytes}` to `B2_ACCOUNTS` in Vercel (Sensitive) and `.env.local`. The next deploy picks it up.
+Each Backblaze account's free tier is 10GB, so each extra account is +10GB. Use one bucket per account.
+
+**Naming.** Pick one short name and use it everywhere: `b2second` for the rclone remote and the `B2_ACCOUNTS` `name`, and `vault-b2second` for the bucket (same pattern as `b2main` / `vault-b2main`; `b2third` / `vault-b2third` next). Bucket names are globally unique across all of B2 -- if it's taken, add a suffix (e.g. `vault-b2second-jp`); only the bucket name changes, the account name stays `b2second`. Never rename the account `name` after uploading: manifest entries store it to find their files.
+
+**1. Backblaze console** (signed in to the *new* Backblaze account)
+
+- Buckets -> Create a Bucket
+  - Bucket Unique Name: `vault-b2second`
+  - Files in Bucket are: **Private**
+  - Default Encryption: **Disable** (files are already end-to-end encrypted)
+  - Object Lock: **Disable** (it would block deletes)
+- Application Keys -> Add a New Application Key
+  - Name of Key: `vault-b2second-webapp`
+  - Allow access to Bucket(s): `vault-b2second` only
+  - Type of Access: **Read and Write**
+  - Leave the other options empty -> Create. Copy the **keyID** and **applicationKey** now -- the key is shown only once.
+
+**2. rclone remote** (holds the key locally so nothing gets pasted into files by hand)
+
+```bash
+rclone config
+```
+
+`n` (new remote) -> name `b2second` -> storage `b2` -> `account` = the keyID -> `key` = the applicationKey -> `hard_delete` = `true` -> accept the defaults for the rest -> `q`. Then check it:
+
+```bash
+rclone lsd b2second:
+```
+
+It should list `vault-b2second`.
+
+**3. Add it to `.env.local`** (run from `webapp/`)
+
+```bash
+node scripts/add-b2-account.mjs b2second vault-b2second
+```
+
+This reads the key from the rclone remote, looks up the `bucketId` (B2's upload API needs it), checks the bucket is Private and the key has read/write/delete/list access, and appends `{name, keyId, applicationKey, bucketId, bucketName, quotaBytes}` to `B2_ACCOUNTS` -- appended means it fills after the earlier B2 accounts. Optional third argument: `quotaBytes` (default `10000000000`). Re-running it for an existing name updates that entry in place.
+
+**4. Push it to Vercel and deploy** (from `webapp/`; `B2_ACCOUNTS` is Sensitive, so it's replaced rather than edited)
+
+```bash
+vercel env rm B2_ACCOUNTS production --yes
+```
+
+```bash
+grep '^B2_ACCOUNTS=' .env.local | cut -d= -f2- | vercel env add B2_ACCOUNTS production --sensitive
+```
+
+```bash
+git commit --allow-empty -m "Redeploy for new B2 account" && git push origin main
+```
+
+Env changes only apply on the next deploy, hence the empty commit. Between the `rm` and the deploy finishing, the live site still runs with the old value, so there's no downtime.
+
+**5. Check it**
+
+```bash
+curl -s https://jaystorage.vercel.app/api/storage
+```
+
+The new account should appear in `accounts` with `"backend":"b2"` and `usedquota: 0`. No code changes are needed: the webapp and `scripts/upload-iphone-pics.mjs` both pick it up from `B2_ACCOUNTS`.
 
 ## Bulk-importing local photos/videos (`scripts/upload-iphone-pics.mjs`)
 
