@@ -1,4 +1,4 @@
-// Bulk-import Downloads/iphone pics into the pCloud vault, alphabetically,
+// Bulk-import Downloads/iphone 1 into the pCloud vault, largest file first,
 // using the exact same crypto pipeline as the browser app (lib/vaultCrypto.ts)
 // and the same pCloud upload path as app/api/upload + app/api/manifest.
 // Run with: node scripts/upload-iphone-pics.mjs
@@ -20,7 +20,15 @@ function loadEnvLocal() {
   const text = readFileSync(envPath, "utf8");
   for (const line of text.split("\n")) {
     const m = line.match(/^([A-Z0-9_]+)=(.*)$/);
-    if (m) process.env[m[1]] = m[2];
+    if (!m) continue;
+    let value = m[2];
+    // `vercel env pull` (and this script's own rclone-sync writer) both wrap
+    // values in a single layer of quotes -- strip only the outermost pair so
+    // JSON values (e.g. PCLOUD_ACCOUNTS/B2_ACCOUNTS) parse correctly.
+    if (value.length >= 2 && ((value[0] === '"' && value.at(-1) === '"') || (value[0] === "'" && value.at(-1) === "'"))) {
+      value = value.slice(1, -1);
+    }
+    process.env[m[1]] = value;
   }
 }
 loadEnvLocal();
@@ -29,7 +37,7 @@ const API_BASE = "https://eapi.pcloud.com/";
 const VAULT_FOLDER_NAME = "vault";
 const SAFETY_MARGIN_BYTES = 50 * 1024 * 1024;
 const B2_SAFETY_MARGIN_BYTES = 200 * 1024 * 1024;
-const WATCH_DIR = path.join(os.homedir(), "Downloads", "iphone pics");
+const WATCH_DIR = path.join(os.homedir(), "Downloads", "iphone 1");
 const WATCHED_EXTENSIONS = new Set([".mov", ".heic", ".jpg", ".jpeg", ".png", ".mp4"]);
 const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
 const RUN_TIMESTAMP = new Date().toISOString().replace(/[:.]/g, "-");
@@ -657,16 +665,27 @@ async function main() {
   const existingFilenames = new Set(Object.values(manifest.entries).map((e) => e.filename));
 
   const dirents = await readdir(WATCH_DIR, { withFileTypes: true });
-  const candidates = dirents
+  const candidateNames = dirents
     .filter((d) => d.isFile())
     .map((d) => d.name)
-    .filter((name) => WATCHED_EXTENSIONS.has(path.extname(name).toLowerCase()))
-    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+    .filter((name) => WATCHED_EXTENSIONS.has(path.extname(name).toLowerCase()));
 
-  log(`Found ${candidates.length} candidate files in ${WATCH_DIR}. Starting alphabetical upload.`);
+  const candidatesWithSize = await Promise.all(
+    candidateNames.map(async (name) => {
+      try {
+        return { name, size: (await stat(path.join(WATCH_DIR, name))).size };
+      } catch {
+        return { name, size: -1 };
+      }
+    })
+  );
+  const candidates = candidatesWithSize.sort((a, b) => b.size - a.size).map((c) => c.name);
+
+  log(`Found ${candidates.length} candidate files in ${WATCH_DIR}. Starting largest-first upload.`);
 
   const uploaded = [];
   const skipped = [];
+  const skippedNoRoom = [];
   const failed = [];
   let stoppedForQuota = false;
 
@@ -696,9 +715,20 @@ async function main() {
     try {
       account = await pickAccountForUpload(allAccounts, size, b2Ledger);
     } catch (e) {
-      log(`STOP: no account has room for ${filename} (${size} bytes) -- ${e.message}`);
-      stoppedForQuota = true;
-      break;
+      // Largest-first means an oversized file doesn't imply every later
+      // (smaller) file is also unplaceable. Only stop the whole run once no
+      // account has room for even a tiny file -- i.e. everything is
+      // genuinely full, not just too small for this one file.
+      try {
+        await pickAccountForUpload(allAccounts, 1, b2Ledger);
+      } catch {
+        log(`STOP: all storage accounts are full -- ${e.message}`);
+        stoppedForQuota = true;
+        break;
+      }
+      skippedNoRoom.push(filename);
+      log(`SKIP (no room for this file): ${filename} (${size} bytes) -- ${e.message}`);
+      continue;
     }
 
     try {
@@ -832,6 +862,7 @@ async function main() {
   log("\n=== SUMMARY ===");
   log(`Uploaded: ${uploaded.length}`);
   log(`Skipped (already present / empty): ${skipped.length}`);
+  log(`Skipped (too large for remaining room, but other accounts had space): ${skippedNoRoom.length}`);
   log(`Failed: ${failed.length}`);
   if (stoppedForQuota) log(`Stopped early: all configured storage accounts are full.`);
   log(`\nFull uploaded list:`);

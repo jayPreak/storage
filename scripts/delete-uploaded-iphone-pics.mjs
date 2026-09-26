@@ -22,7 +22,7 @@ import { readFileSync, existsSync, unlinkSync, readdirSync, statSync } from "nod
 import path from "node:path";
 import os from "node:os";
 
-const WATCH_DIR = path.join(os.homedir(), "Downloads", "iphone pics");
+const WATCH_DIR = path.join(os.homedir(), "Downloads", "iphone 1");
 
 const DRY_RUN = !process.argv.includes("--yes");
 const fileArg = process.argv.slice(2).find((a) => a !== "--yes");
