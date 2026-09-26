@@ -865,16 +865,55 @@ export default function Home() {
   // the rest are dropped and re-requested if they scroll back into range.
   const nearIds = useRef<Set<string>>(new Set());
   const tileEls = useRef<Map<string, Element>>(new Map());
+  // Decoded thumbnail blobs are cheap to re-fetch (IndexedDB cache via
+  // getCachedThumb/putCachedThumb), so once a tile has been out of the near
+  // window for a while we drop its object URL rather than holding every
+  // thumbnail ever scrolled past for the life of the tab -- iOS Safari's
+  // per-tab memory ceiling is much lower than desktop Chrome's.
+  const evictTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const EVICT_DELAY_MS = 4000;
+
+  function evictThumb(id: string) {
+    evictTimers.current.delete(id);
+    if (nearIds.current.has(id)) return; // came back near before the timer fired
+    thumbsRequested.current.delete(id);
+    setThumbs((prev) => {
+      if (!(id in prev)) return prev;
+      URL.revokeObjectURL(prev[id]);
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }
+
   function handleTileNear(entry: ManifestEntry, near: boolean, el: Element) {
+    const id = entry.file_id_hex;
     if (near) {
-      nearIds.current.add(entry.file_id_hex);
-      tileEls.current.set(entry.file_id_hex, el);
+      nearIds.current.add(id);
+      tileEls.current.set(id, el);
+      const pending = evictTimers.current.get(id);
+      if (pending) {
+        clearTimeout(pending);
+        evictTimers.current.delete(id);
+      }
       void loadThumbnail(entry);
     } else {
-      nearIds.current.delete(entry.file_id_hex);
-      tileEls.current.delete(entry.file_id_hex);
+      nearIds.current.delete(id);
+      tileEls.current.delete(id);
+      if (!evictTimers.current.has(id)) {
+        evictTimers.current.set(id, setTimeout(() => evictThumb(id), EVICT_DELAY_MS));
+      }
     }
   }
+
+  // Flush any pending eviction timers on unmount so they don't fire (and
+  // revoke URLs) after the component is gone.
+  useEffect(() => {
+    return () => {
+      for (const timer of evictTimers.current.values()) clearTimeout(timer);
+      evictTimers.current.clear();
+    };
+  }, []);
 
   function showThumb(id: string, blob: Blob) {
     thumbsRequested.current.add(id);
