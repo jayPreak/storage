@@ -83,18 +83,20 @@ Each Backblaze account's free tier is 10GB, so each extra account is +10GB. Use 
 
 **Naming.** Pick one short name and use it everywhere: `b2second` for the rclone remote and the `B2_ACCOUNTS` `name`, and `vault-b2second` for the bucket (same pattern as `b2main` / `vault-b2main`; `b2third` / `vault-b2third` next). Bucket names are globally unique across all of B2 -- if it's taken, add a suffix (e.g. `vault-b2second-jp`); only the bucket name changes, the account name stays `b2second`. Never rename the account `name` after uploading: manifest entries store it to find their files.
 
-**1. Backblaze console** (signed in to the *new* Backblaze account)
+**1. Backblaze website**
 
-- Buckets -> Create a Bucket
+- Sign up at backblaze.com -> **B2 Cloud Storage** (not Computer Backup) -> "Sign Up" with an email you haven't used for Backblaze before (each account = its own 10GB). No card is needed for the free tier. Verify the email, then sign in.
+- In the left sidebar under **B2 Cloud Storage**: **Buckets** -> **Create a Bucket**
   - Bucket Unique Name: `vault-b2second`
   - Files in Bucket are: **Private**
   - Default Encryption: **Disable** (files are already end-to-end encrypted)
   - Object Lock: **Disable** (it would block deletes)
-- Application Keys -> Add a New Application Key
+- Left sidebar -> **Application Keys** -> **Add a New Application Key** (don't use the Master Application Key at the top of that page -- it can touch every bucket)
   - Name of Key: `vault-b2second-webapp`
-  - Allow access to Bucket(s): `vault-b2second` only
+  - Allow access to Bucket(s): `vault-b2second` (not "All")
   - Type of Access: **Read and Write**
-  - Leave the other options empty -> Create. Copy the **keyID** and **applicationKey** now -- the key is shown only once.
+  - Allow List All Bucket Names: leave unchecked; File name prefix and Duration: leave empty
+  - **Create New Key**. The confirmation shows `keyID` (starts with `00...`, ~25 chars) and `applicationKey` (starts with `K00...`, ~31 chars). Copy both now -- `applicationKey` is shown **only once**; if you lose it, delete the key and make a new one.
 
 **2. rclone remote** (holds the key locally so nothing gets pasted into files by hand)
 
