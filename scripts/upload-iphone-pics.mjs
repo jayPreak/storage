@@ -1,4 +1,4 @@
-// Bulk-import Downloads/iphone pics into the pCloud vault, alphabetically,
+// Bulk-import Downloads/iphone 1 into the pCloud vault, largest file first,
 // using the exact same crypto pipeline as the browser app (lib/vaultCrypto.ts)
 // and the same pCloud upload path as app/api/upload + app/api/manifest.
 // Run with: node scripts/upload-iphone-pics.mjs
@@ -29,7 +29,7 @@ const API_BASE = "https://eapi.pcloud.com/";
 const VAULT_FOLDER_NAME = "vault";
 const SAFETY_MARGIN_BYTES = 50 * 1024 * 1024;
 const B2_SAFETY_MARGIN_BYTES = 200 * 1024 * 1024;
-const WATCH_DIR = path.join(os.homedir(), "Downloads", "iphone pics");
+const WATCH_DIR = path.join(os.homedir(), "Downloads", "iphone 1");
 const WATCHED_EXTENSIONS = new Set([".mov", ".heic", ".jpg", ".jpeg", ".png", ".mp4"]);
 const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
 const RUN_TIMESTAMP = new Date().toISOString().replace(/[:.]/g, "-");
@@ -657,13 +657,23 @@ async function main() {
   const existingFilenames = new Set(Object.values(manifest.entries).map((e) => e.filename));
 
   const dirents = await readdir(WATCH_DIR, { withFileTypes: true });
-  const candidates = dirents
+  const candidateNames = dirents
     .filter((d) => d.isFile())
     .map((d) => d.name)
-    .filter((name) => WATCHED_EXTENSIONS.has(path.extname(name).toLowerCase()))
-    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+    .filter((name) => WATCHED_EXTENSIONS.has(path.extname(name).toLowerCase()));
 
-  log(`Found ${candidates.length} candidate files in ${WATCH_DIR}. Starting alphabetical upload.`);
+  const candidatesWithSize = await Promise.all(
+    candidateNames.map(async (name) => {
+      try {
+        return { name, size: (await stat(path.join(WATCH_DIR, name))).size };
+      } catch {
+        return { name, size: -1 };
+      }
+    })
+  );
+  const candidates = candidatesWithSize.sort((a, b) => b.size - a.size).map((c) => c.name);
+
+  log(`Found ${candidates.length} candidate files in ${WATCH_DIR}. Starting largest-first upload.`);
 
   const uploaded = [];
   const skipped = [];
