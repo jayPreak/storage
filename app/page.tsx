@@ -1069,7 +1069,7 @@ export default function Home() {
           { method: "POST", body: encrypted as BodyInit }
         );
         if (!uploadRes.ok) throw new Error(`upload failed for ${file.name}`);
-        const { backend, account } = (await uploadRes.json()) as { backend: "pcloud" | "b2"; account: string };
+        const { backend, account } = (await uploadRes.json()) as { backend: "pcloud" | "b2" | "mega"; account: string };
 
         const entry: ManifestEntry = {
           file_id_hex: fileIdHex,

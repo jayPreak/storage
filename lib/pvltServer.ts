@@ -12,6 +12,7 @@ import {
   getFileLink,
 } from "@/lib/pcloudServer";
 import * as b2 from "@/lib/b2Server";
+import * as mega from "@/lib/megaServer";
 
 const MAGIC = Buffer.from("PVLT");
 const NONCE_LEN = 12;
@@ -85,12 +86,18 @@ export function decryptPvltObject(
 export async function fetchObjectCiphertext(
   fileIdHex: string,
   accountName?: string,
-  backend: "pcloud" | "b2" = "pcloud"
+  backend: "pcloud" | "b2" | "mega" = "pcloud"
 ): Promise<Buffer> {
   const filename = `${fileIdHex}.pvlt`;
   if (backend === "b2") {
     const b2Account = accountName ? b2.accountByName(accountName) : undefined;
     const buf = b2Account ? await b2.fetchObjectCiphertext(b2Account, filename) : null;
+    if (!buf) throw new Error("object not found");
+    return buf;
+  }
+  if (backend === "mega") {
+    const megaAccount = accountName ? mega.accountByName(accountName) : undefined;
+    const buf = megaAccount ? await mega.fetchObjectCiphertext(megaAccount, filename) : null;
     if (!buf) throw new Error("object not found");
     return buf;
   }

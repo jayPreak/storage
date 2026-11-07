@@ -4,6 +4,7 @@
 // B2_ACCOUNTS order -- adding an account to either list is config-only.
 import * as pcloud from "@/lib/pcloudServer";
 import * as b2 from "@/lib/b2Server";
+import * as mega from "@/lib/megaServer";
 import type { Backend } from "@/lib/storageBackend";
 
 export { resolveBackend } from "@/lib/storageBackend";
@@ -16,12 +17,15 @@ export interface StorageAccount {
 
 export type ResolvedAccount =
   | { backend: "pcloud"; account: pcloud.PcloudAccount }
-  | { backend: "b2"; account: b2.B2Account };
+  | { backend: "b2"; account: b2.B2Account }
+  | { backend: "mega"; account: mega.MegaAccount };
 
 const PCLOUD_SAFETY_MARGIN_BYTES = 50 * 1024 * 1024;
 // Bigger than pCloud's: B2 usage is our own ledger, which can drift a bit
 // (concurrent read-modify-writes, uploads whose manifest save then failed).
 const B2_SAFETY_MARGIN_BYTES = 200 * 1024 * 1024;
+// MEGA reports live usage, so a pCloud-sized margin is enough.
+const MEGA_SAFETY_MARGIN_BYTES = 50 * 1024 * 1024;
 
 const SUMMARY_FILENAME = "storage-summary.json";
 
@@ -112,9 +116,22 @@ export async function pickAccountForUpload(fileSizeBytes: number): Promise<Stora
     }
   }
 
+  // MEGA last: live quota like pCloud, but logins are slow/throttled, so
+  // only reach for it once the earlier accounts are full.
+  for (const account of mega.loadAccounts()) {
+    try {
+      const { quota, usedquota } = await mega.getQuota(account);
+      if (quota - usedquota >= fileSizeBytes + MEGA_SAFETY_MARGIN_BYTES) {
+        return { backend: "mega", name: account.name };
+      }
+    } catch (e) {
+      errors.push(`mega/${account.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   throw new Error(
     `All configured storage accounts are full (or unreachable) for a ${fileSizeBytes}-byte upload. ` +
-      `Add another account to PCLOUD_ACCOUNTS or B2_ACCOUNTS.` +
+      `Add another account to PCLOUD_ACCOUNTS, B2_ACCOUNTS or MEGA_ACCOUNTS.` +
       (errors.length ? ` Errors: ${errors.join("; ")}` : "")
   );
 }
@@ -122,6 +139,10 @@ export async function pickAccountForUpload(fileSizeBytes: number): Promise<Stora
 export function resolveAccount(backend: Backend, name: string): ResolvedAccount | null {
   if (backend === "b2") {
     const account = b2.accountByName(name);
+    return account ? { backend, account } : null;
+  }
+  if (backend === "mega") {
+    const account = mega.accountByName(name);
     return account ? { backend, account } : null;
   }
   const account = pcloud.accountByName(name);
@@ -133,5 +154,6 @@ export function resolveAccount(backend: Backend, name: string): ResolvedAccount 
 export function parseBackendParam(value: string | null | undefined): Backend | null {
   if (value === undefined || value === null || value === "" || value === "pcloud") return "pcloud";
   if (value === "b2") return "b2";
+  if (value === "mega") return "mega";
   return null;
 }

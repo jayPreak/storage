@@ -1,10 +1,11 @@
 // This route never sees plaintext -- the body is already ciphertext
 // produced client-side (encryptPvltObject output). It just picks a storage
-// account (pCloud or B2) with enough free space and forwards the bytes.
+// account (pCloud, B2 or MEGA) with enough free space and forwards the bytes.
 import { NextResponse } from "next/server";
 import { isValidFileIdHex } from "@/lib/vaultPaths";
 import * as pcloud from "@/lib/pcloudServer";
 import * as b2 from "@/lib/b2Server";
+import * as mega from "@/lib/megaServer";
 import { pickAccountForUpload, adjustB2UsageBestEffort } from "@/lib/storageServer";
 
 export async function POST(req: Request) {
@@ -28,6 +29,9 @@ export async function POST(req: Request) {
       const account = b2.accountByName(picked.name)!;
       await b2.uploadCiphertext(account, `${fileId}.pvlt`, buffer);
       await adjustB2UsageBestEffort(account.name, buffer.length);
+    } else if (picked.backend === "mega") {
+      const account = mega.accountByName(picked.name)!;
+      await mega.uploadCiphertext(account, `${fileId}.pvlt`, buffer);
     } else {
       const account = pcloud.accountByName(picked.name)!;
       const folderid = await pcloud.ensureVaultFolder(account.token);

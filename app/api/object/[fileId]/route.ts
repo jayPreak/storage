@@ -7,6 +7,7 @@ import { NextResponse } from "next/server";
 import { isValidFileIdHex } from "@/lib/vaultPaths";
 import { accountByName, findAccountHoldingFile, ensureVaultFolder, getFileidInFolder, getFileLink, deleteFile, deleteByPath, primaryAccount } from "@/lib/pcloudServer";
 import * as b2 from "@/lib/b2Server";
+import * as mega from "@/lib/megaServer";
 import { adjustB2UsageBestEffort, parseBackendParam } from "@/lib/storageServer";
 
 const OBJECT_HEADERS = {
@@ -50,6 +51,15 @@ export async function GET(
         return NextResponse.json({ error: "object not found" }, { status: 404 });
       }
       return new NextResponse(upstream.body, { status: 200, headers: OBJECT_HEADERS });
+    }
+
+    if (backend === "mega") {
+      const account = accountName ? mega.accountByName(accountName) : undefined;
+      const bytes = account ? await mega.fetchObjectCiphertext(account, filename) : null;
+      if (!bytes) {
+        return NextResponse.json({ error: "object not found" }, { status: 404 });
+      }
+      return new NextResponse(new Uint8Array(bytes), { status: 200, headers: OBJECT_HEADERS });
     }
 
     const account = accountName ? accountByName(accountName) : await findAccountHoldingFile(filename);
@@ -105,6 +115,16 @@ export async function DELETE(
       // Best-effort thumbnail cleanup, same as pCloud below.
       const thumbFreed = await b2.deleteFile(account, `${b2.THUMBS_PREFIX}${filename}`).catch(() => 0);
       await adjustB2UsageBestEffort(account.name, -(freed + thumbFreed));
+      return NextResponse.json(freed > 0 ? { ok: true } : { ok: true, alreadyGone: true });
+    }
+
+    if (backend === "mega") {
+      const account = accountName ? mega.accountByName(accountName) : undefined;
+      if (!account) {
+        return NextResponse.json({ ok: true, alreadyGone: true });
+      }
+      const freed = await mega.deleteObject(account, filename);
+      await mega.deleteFile(account, mega.THUMBS_FOLDER, filename).catch(() => 0);
       return NextResponse.json(freed > 0 ? { ok: true } : { ok: true, alreadyGone: true });
     }
 
