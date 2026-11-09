@@ -123,9 +123,10 @@ export async function DELETE(
       if (!account) {
         return NextResponse.json({ ok: true, alreadyGone: true });
       }
-      const freed = await mega.deleteObject(account, filename);
-      await mega.deleteFile(account, mega.THUMBS_FOLDER, filename).catch(() => 0);
-      return NextResponse.json(freed > 0 ? { ok: true } : { ok: true, alreadyGone: true });
+      // The webapp never logs in to MEGA (read-only folder link), so it
+      // can't remove the blob; it's now just an orphan in MEGA, removable
+      // later with rclone. The manifest entry is still dropped by the client.
+      return NextResponse.json({ ok: true, remoteKept: true });
     }
 
     const account = accountName ? accountByName(accountName) : await findAccountHoldingFile(filename);

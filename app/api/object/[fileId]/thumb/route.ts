@@ -8,7 +8,6 @@ import { NextResponse } from "next/server";
 import { isValidFileIdHex } from "@/lib/vaultPaths";
 import { accountByName, getFileLinkByPath, primaryAccount, uploadToPath } from "@/lib/pcloudServer";
 import * as b2 from "@/lib/b2Server";
-import * as mega from "@/lib/megaServer";
 import { adjustB2UsageBestEffort, parseBackendParam, type ResolvedAccount } from "@/lib/storageServer";
 
 const THUMBS_FOLDER = "/vault-thumbs";
@@ -18,7 +17,7 @@ const MAX_THUMB_BYTES = 2 * 1024 * 1024;
 // primary pCloud account for legacy entries with no recorded account) so
 // GET and PUT always agree on where to look. B2 thumbs live under
 // b2.THUMBS_PREFIX in the original's bucket.
-function resolveAccount(req: Request): ResolvedAccount | null {
+function resolveAccount(req: Request): Exclude<ResolvedAccount, { backend: "mega" }> | null {
   const searchParams = new URL(req.url).searchParams;
   const name = searchParams.get("account");
   const backend = parseBackendParam(searchParams.get("backend"));
@@ -27,8 +26,9 @@ function resolveAccount(req: Request): ResolvedAccount | null {
     return account ? { backend, account } : null;
   }
   if (backend === "mega") {
-    const account = name ? mega.accountByName(name) : undefined;
-    return account ? { backend, account } : null;
+    // MEGA is read-only here, so thumbnails of MEGA-hosted files live in the
+    // primary pCloud account (the same fallback legacy entries use).
+    return { backend: "pcloud", account: primaryAccount() };
   }
   if (backend === "pcloud") {
     const account = name ? accountByName(name) : primaryAccount();
@@ -50,9 +50,6 @@ export async function GET(req: Request, { params }: { params: Promise<{ fileId: 
     let upstream: Response | null;
     if (resolved.backend === "b2") {
       upstream = await b2.downloadFile(resolved.account, `${b2.THUMBS_PREFIX}${fileId}.pvlt`);
-    } else if (resolved.backend === "mega") {
-      const bytes = await mega.downloadFile(resolved.account, mega.THUMBS_FOLDER, `${fileId}.pvlt`);
-      upstream = bytes ? new Response(new Uint8Array(bytes)) : null;
     } else {
       const link = await getFileLinkByPath(resolved.account.token, `${THUMBS_FOLDER}/${fileId}.pvlt`);
       upstream = link ? await fetch(link) : null;
@@ -90,8 +87,6 @@ export async function PUT(req: Request, { params }: { params: Promise<{ fileId: 
     if (resolved.backend === "b2") {
       await b2.uploadFile(resolved.account, `${b2.THUMBS_PREFIX}${fileId}.pvlt`, body);
       await adjustB2UsageBestEffort(resolved.account.name, body.length);
-    } else if (resolved.backend === "mega") {
-      await mega.uploadFile(resolved.account, mega.THUMBS_FOLDER, `${fileId}.pvlt`, body);
     } else {
       await uploadToPath(resolved.account.token, THUMBS_FOLDER, `${fileId}.pvlt`, body);
     }

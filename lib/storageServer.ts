@@ -24,8 +24,6 @@ const PCLOUD_SAFETY_MARGIN_BYTES = 50 * 1024 * 1024;
 // Bigger than pCloud's: B2 usage is our own ledger, which can drift a bit
 // (concurrent read-modify-writes, uploads whose manifest save then failed).
 const B2_SAFETY_MARGIN_BYTES = 200 * 1024 * 1024;
-// MEGA reports live usage, so a pCloud-sized margin is enough.
-const MEGA_SAFETY_MARGIN_BYTES = 50 * 1024 * 1024;
 
 const SUMMARY_FILENAME = "storage-summary.json";
 
@@ -116,22 +114,9 @@ export async function pickAccountForUpload(fileSizeBytes: number): Promise<Stora
     }
   }
 
-  // MEGA last: live quota like pCloud, but logins are slow/throttled, so
-  // only reach for it once the earlier accounts are full.
-  for (const account of mega.loadAccounts()) {
-    try {
-      const { quota, usedquota } = await mega.getQuota(account);
-      if (quota - usedquota >= fileSizeBytes + MEGA_SAFETY_MARGIN_BYTES) {
-        return { backend: "mega", name: account.name };
-      }
-    } catch (e) {
-      errors.push(`mega/${account.name}: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
   throw new Error(
     `All configured storage accounts are full (or unreachable) for a ${fileSizeBytes}-byte upload. ` +
-      `Add another account to PCLOUD_ACCOUNTS, B2_ACCOUNTS or MEGA_ACCOUNTS.` +
+      `Add another account to PCLOUD_ACCOUNTS or B2_ACCOUNTS. (MEGA is read-only here: uploads to it happen via rclone.)` +
       (errors.length ? ` Errors: ${errors.join("; ")}` : "")
   );
 }
