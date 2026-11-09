@@ -80,7 +80,15 @@ export async function GET(
     }
 
     return new NextResponse(upstream.body, { status: 200, headers: OBJECT_HEADERS });
-  } catch {
+  } catch (e) {
+    // MEGA pushing back (quota/congestion/block) is not "missing": tell the
+    // client to retry later instead of caching a not-found.
+    if (e instanceof mega.MegaUnavailableError) {
+      return NextResponse.json(
+        { error: "storage temporarily unavailable" },
+        { status: 503, headers: { "Retry-After": String(e.retryAfterSeconds), "Cache-Control": "no-store" } }
+      );
+    }
     return NextResponse.json({ error: "object not found" }, { status: 404 });
   }
 }

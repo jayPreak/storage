@@ -9,6 +9,7 @@
 import { NextResponse } from "next/server";
 import { loadAccounts, getQuota } from "@/lib/pcloudServer";
 import * as b2 from "@/lib/b2Server";
+import * as mega from "@/lib/megaServer";
 import { readStorageSummary, type StorageSummary } from "@/lib/storageServer";
 
 interface StorageSummaryAccount {
@@ -43,7 +44,7 @@ export async function GET() {
     const accounts = loadAccounts();
     let quota = 0;
     let usedquota = 0;
-    const perAccount: { name: string; backend: "pcloud" | "b2"; quota: number; usedquota: number }[] = [];
+    const perAccount: { name: string; backend: "pcloud" | "b2" | "mega"; quota: number; usedquota: number }[] = [];
     for (const account of accounts) {
       try {
         const q = await getQuota(account.token);
@@ -66,10 +67,23 @@ export async function GET() {
       perAccount.push({ name: account.name, backend: "b2", quota: account.quotaBytes, usedquota: used });
     }
 
-    // MEGA is read-only here (no login, so no live quota); its capacity
-    // comes from the rclone entries the upload script writes into
-    // storage-summary.json and is folded in via `other` below.
-    const other = otherBackendsTotal(summary, new Set(b2Accounts.map((a) => a.name)));
+    // MEGA: usage is summed from the public folder link's listing (cached,
+    // no login); quota is operator-supplied (quotaBytes, default 20 GiB).
+    const megaAccounts = mega.loadAccounts();
+    for (const account of megaAccounts) {
+      try {
+        const used = await mega.usedBytes(account);
+        const q = account.quotaBytes ?? mega.DEFAULT_QUOTA_BYTES;
+        quota += q;
+        usedquota += used;
+        perAccount.push({ name: account.name, backend: "mega", quota: q, usedquota: used });
+      } catch {
+        // MEGA unavailable -- skip, don't fail the aggregate
+      }
+    }
+
+    // A B2/MEGA remote that's also an rclone remote is already counted live.
+    const other = otherBackendsTotal(summary, new Set([...b2Accounts, ...megaAccounts].map((a) => a.name)));
     const grandQuota = quota + (other?.quota ?? 0);
     const grandUsedquota = usedquota + (other?.usedquota ?? 0);
 

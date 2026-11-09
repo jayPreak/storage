@@ -1,26 +1,34 @@
-// Server-only, READ-ONLY MEGA client (via `megajs`) that reads through a
-// MEGA public *folder link* -- the webapp never logs in to MEGA.
+// Server-only, READ-ONLY MEGA client (via `megajs`) that reads through MEGA
+// public *folder links* -- the webapp never logs in to MEGA.
 //
-// Why: MEGA flags accounts that log in from many IPs in a short time, and
-// every serverless instance logging in separately looks exactly like that
-// (that is how the first account got blocked). A folder link needs no
-// login, so there is nothing to flag. Everything in the folder is opaque
-// ciphertext already encrypted client-side, so the link alone reveals no
-// photo content, but treat it as a secret anyway (MEGA_ACCOUNTS is a
-// server-only env var).
+// Why: MEGA administratively blocks accounts that log in too often / from
+// too many places (rclone's docs: rapid successive commands get a remote
+// blocked, recovering after ~a week). Every serverless instance logging in
+// separately is exactly that pattern, and is how the first account got
+// blocked. A folder link needs no login, so there is nothing to block.
 //
-// Writes (uploads, deletes, quota checks) are NOT done here. They need a
-// login, so they happen from the owner's machine through rclone / the vault
-// scripts. Create the link once with `rclone link <remote>:vault` (see
-// scripts/add-mega-account.mjs).
+// Everything in the folders is opaque ciphertext already encrypted
+// client-side, so a link alone reveals no photo content, but treat links as
+// secrets anyway (MEGA_ACCOUNTS is a server-only env var).
 //
-// MEGA_ACCOUNTS is a JSON array: [{ "name": "mega", "folderLink": "https://mega.nz/folder/ID#KEY" }]
+// Writes (uploads, deletes) need a login, so they are NOT done here; they
+// happen from the owner's machine through rclone / the vault scripts.
+//
+// MEGA_ACCOUNTS is a JSON array:
+//   [{ "name": "mega",
+//      "folderLink": "https://mega.nz/folder/ID#KEY",   // the `vault` folder
+//      "thumbsLink": "https://mega.nz/folder/ID#KEY",   // optional `vault-thumbs`
+//      "quotaBytes": 21474836480 }]                      // optional, for the storage UI
 import { File } from "megajs";
 
 export interface MegaAccount {
   name: string;
-  folderLink: string; // public link to the account's `vault` folder
+  folderLink: string;
+  thumbsLink?: string;
+  quotaBytes?: number;
 }
+
+export const DEFAULT_QUOTA_BYTES = 20 * 1024 * 1024 * 1024;
 
 export function loadAccounts(): MegaAccount[] {
   const raw = process.env.MEGA_ACCOUNTS;
@@ -36,8 +44,57 @@ export function accountByName(name: string): MegaAccount | undefined {
   return loadAccounts().find((a) => a.name === name);
 }
 
-// One cached folder listing per account, shared by concurrent requests on a
-// warm instance. A listing is a single API call for the whole folder.
+// Thrown when MEGA is pushing back (transfer quota, congestion, block). The
+// routes turn it into a 503 + Retry-After instead of "object not found", so
+// the client retries later rather than treating the file as missing.
+export class MegaUnavailableError extends Error {
+  retryAfterSeconds: number;
+  constructor(retryAfterSeconds: number, detail: string) {
+    super(`MEGA temporarily unavailable: ${detail}`);
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+// ---- Circuit breaker: once MEGA says no, stop asking for a while ----------
+const COOLDOWN_MS = 10 * 60 * 1000;
+let cooldownUntil = 0;
+let cooldownReason = "";
+
+function checkCooldown() {
+  if (Date.now() < cooldownUntil) {
+    throw new MegaUnavailableError(Math.ceil((cooldownUntil - Date.now()) / 1000), cooldownReason);
+  }
+}
+
+// megajs errors look like "EOVERQUOTA (-17): ..." / "EAGAIN (-3): ..." /
+// "EBLOCKED (-16): ...". Anything that means "slow down" trips the breaker.
+function tripIfThrottled(e: unknown): never {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (/EOVERQUOTA|EAGAIN|EBLOCKED|ETOOMANY|ERATELIMIT|\(-(3|16|17|18)\)|quota|509/i.test(msg)) {
+    cooldownUntil = Date.now() + COOLDOWN_MS;
+    cooldownReason = msg.slice(0, 120);
+    throw new MegaUnavailableError(COOLDOWN_MS / 1000, cooldownReason);
+  }
+  throw e;
+}
+
+// ---- Concurrency cap: a gallery fires dozens of requests at once ----------
+const MAX_CONCURRENT = 3;
+let active = 0;
+const waiters: (() => void)[] = [];
+
+async function limited<T>(fn: () => Promise<T>): Promise<T> {
+  if (active >= MAX_CONCURRENT) await new Promise<void>((r) => waiters.push(r));
+  active++;
+  try {
+    return await fn();
+  } finally {
+    active--;
+    waiters.shift()?.();
+  }
+}
+
+// ---- Folder listings: one cached listing per link, one API call each ------
 const LISTING_TTL_MS = 10 * 60 * 1000;
 // Don't re-list more often than this even on repeated misses, so a burst of
 // requests for missing files can't hammer MEGA.
@@ -49,44 +106,73 @@ interface Listing {
 }
 const listings = new Map<string, Promise<Listing>>();
 
-function loadListing(account: MegaAccount): Promise<Listing> {
+function loadListing(link: string): Promise<Listing> {
   const p = (async () => {
-    const folder = File.fromURL(account.folderLink);
-    await folder.loadAttributes();
-    const byName = new Map<string, File>();
-    for (const child of folder.children ?? []) {
-      if (!child.directory && child.name) byName.set(child.name, child);
+    try {
+      const folder = File.fromURL(link);
+      await folder.loadAttributes();
+      const byName = new Map<string, File>();
+      for (const child of folder.children ?? []) {
+        if (!child.directory && child.name) byName.set(child.name, child);
+      }
+      return { loadedAt: Date.now(), byName };
+    } catch (e) {
+      return tripIfThrottled(e);
     }
-    return { loadedAt: Date.now(), byName };
   })();
-  listings.set(account.name, p);
-  // A failed listing must not be cached.
+  listings.set(link, p);
   p.catch(() => {
-    if (listings.get(account.name) === p) listings.delete(account.name);
+    if (listings.get(link) === p) listings.delete(link); // never cache a failure
   });
   return p;
 }
 
-async function listing(account: MegaAccount, forceFresh = false): Promise<Listing> {
-  const cached = listings.get(account.name);
+async function listing(link: string, forceFresh = false): Promise<Listing> {
+  const cached = listings.get(link);
   const l = cached ? await cached.catch(() => null) : null;
   if (l) {
     const age = Date.now() - l.loadedAt;
     if (!forceFresh && age < LISTING_TTL_MS) return l;
     if (forceFresh && age < MIN_RELIST_MS) return l; // refreshed too recently
   }
-  return loadListing(account);
+  checkCooldown();
+  return loadListing(link);
 }
 
-// Returns null when the file doesn't exist so callers can map it to 404.
-export async function fetchObjectCiphertext(account: MegaAccount, filename: string): Promise<Buffer | null> {
-  let l = await listing(account);
+async function fetchFrom(link: string, filename: string): Promise<Buffer | null> {
+  let l = await listing(link);
   let file = l.byName.get(filename);
   if (!file) {
     // Maybe uploaded since our snapshot; refresh once (rate-limited).
-    l = await listing(account, true);
+    l = await listing(link, true);
     file = l.byName.get(filename);
     if (!file) return null;
   }
-  return file.downloadBuffer({});
+  checkCooldown();
+  const f = file;
+  return limited(async () => {
+    try {
+      return await f.downloadBuffer({});
+    } catch (e) {
+      return tripIfThrottled(e);
+    }
+  });
+}
+
+// Returns null when the file doesn't exist so callers can map it to 404.
+export function fetchObjectCiphertext(account: MegaAccount, filename: string): Promise<Buffer | null> {
+  return fetchFrom(account.folderLink, filename);
+}
+
+export async function fetchThumbCiphertext(account: MegaAccount, filename: string): Promise<Buffer | null> {
+  if (!account.thumbsLink) return null;
+  return fetchFrom(account.thumbsLink, filename);
+}
+
+// Used bytes of the `vault` folder, summed from the (cached) listing: no login.
+export async function usedBytes(account: MegaAccount): Promise<number> {
+  const l = await listing(account.folderLink);
+  let total = 0;
+  for (const f of l.byName.values()) total += f.size ?? 0;
+  return total;
 }

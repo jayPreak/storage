@@ -8,6 +8,7 @@ import { NextResponse } from "next/server";
 import { isValidFileIdHex } from "@/lib/vaultPaths";
 import { accountByName, getFileLinkByPath, primaryAccount, uploadToPath } from "@/lib/pcloudServer";
 import * as b2 from "@/lib/b2Server";
+import * as mega from "@/lib/megaServer";
 import { adjustB2UsageBestEffort, parseBackendParam, type ResolvedAccount } from "@/lib/storageServer";
 
 const THUMBS_FOLDER = "/vault-thumbs";
@@ -45,6 +46,28 @@ export async function GET(req: Request, { params }: { params: Promise<{ fileId: 
   const notFound = () =>
     NextResponse.json({ error: "no stored thumbnail" }, { status: 404, headers: { "Cache-Control": "no-store" } });
   try {
+    // Thumbnails of MEGA-hosted files may already sit in the account's MEGA
+    // `vault-thumbs` folder (read via its public link, no login). Anything
+    // not there falls through to the pCloud copy below.
+    const sp = new URL(req.url).searchParams;
+    if (sp.get("backend") === "mega") {
+      const megaAccount = sp.get("account") ? mega.accountByName(sp.get("account")!) : undefined;
+      try {
+        const bytes = megaAccount ? await mega.fetchThumbCiphertext(megaAccount, `${fileId}.pvlt`) : null;
+        if (bytes) {
+          return new NextResponse(new Uint8Array(bytes), {
+            status: 200,
+            headers: {
+              "Content-Type": "application/octet-stream",
+              "Cache-Control": "private, max-age=31536000, immutable",
+            },
+          });
+        }
+      } catch (e) {
+        // MEGA unavailable: just use the pCloud copy / let the client regenerate.
+        if (!(e instanceof mega.MegaUnavailableError)) throw e;
+      }
+    }
     const resolved = resolveAccount(req);
     if (!resolved) return notFound();
     let upstream: Response | null;
