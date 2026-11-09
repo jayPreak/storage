@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   deriveMasterKey,
   deriveSubkeys,
@@ -135,17 +135,23 @@ function formatBytes(n: number): string {
   return gb >= 10 ? `${gb.toFixed(0)} GB` : `${gb.toFixed(1)} GB`;
 }
 
-function dateGroupLabel(ts: number): string {
+// toLocaleDateString builds a fresh Intl formatter on every call, which is
+// slow in Safari when it runs once per entry for thousands of entries, so
+// the formatters are created once and reused.
+let dayFmt: Intl.DateTimeFormat | null = null;
+let dayYearFmt: Intl.DateTimeFormat | null = null;
+function dateGroupLabel(ts: number, now: Date): string {
   const d = new Date(ts * 1000);
-  const now = new Date();
   const startOfDay = (dt: Date) => new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()).getTime();
   const diffDays = Math.round((startOfDay(now) - startOfDay(d)) / 86400000);
   if (diffDays === 0) return "Today";
   if (diffDays === 1) return "Yesterday";
   if (d.getFullYear() === now.getFullYear()) {
-    return d.toLocaleDateString(undefined, { month: "long", day: "numeric" });
+    dayFmt ??= new Intl.DateTimeFormat(undefined, { month: "long", day: "numeric" });
+    return dayFmt.format(d);
   }
-  return d.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
+  dayYearFmt ??= new Intl.DateTimeFormat(undefined, { month: "long", day: "numeric", year: "numeric" });
+  return dayYearFmt.format(d);
 }
 
 // Thumbnail pipeline limits. Fetching an already-stored encrypted thumbnail
@@ -272,9 +278,15 @@ type TileProps = {
   onTileClick: (entry: ManifestEntry, e: React.MouseEvent) => void;
   onCheckClick: (entry: ManifestEntry, e: React.MouseEvent) => void;
   onNearChange: (entry: ManifestEntry, near: boolean, el: Element) => void;
+  // The name/size overlay only ever shows on mouse hover, so touch layouts
+  // skip rendering it (thousands of extra DOM nodes otherwise).
+  showOverlay: boolean;
 };
 
-function Tile({ entry, thumbUrl, selected, loading, onTileClick, onCheckClick, onNearChange }: TileProps) {
+// Memoized: the grid can hold thousands of tiles, and without this every
+// thumbnail that arrives re-rendered all of them. Every prop is either a
+// primitive or kept referentially stable by Home.
+const Tile = memo(function Tile({ entry, thumbUrl, selected, loading, onTileClick, onCheckClick, onNearChange, showOverlay }: TileProps) {
   const ref = useRef<HTMLDivElement>(null);
   const [near, setNear] = useState(false);
   const onNearRef = useRef(onNearChange);
@@ -308,16 +320,18 @@ function Tile({ entry, thumbUrl, selected, loading, onTileClick, onCheckClick, o
         <img src={thumbUrl} alt={entry.filename} className={styles.thumbImg} decoding="async" draggable={false} />
       ) : (
         <div className={styles.tilePlaceholder}>
-          <div className={styles.tileIcon}>{isVideo ? "\u{1F3A5}" : "\u{1F5BC}️"}</div>
+          {near && <div className={styles.tileIcon}>{isVideo ? "\u{1F3A5}" : "\u{1F5BC}️"}</div>}
         </div>
       )}
-      <div className={styles.tileOverlay}>
-        <div className={styles.tileName}>{entry.filename}</div>
-        <div className={styles.tileMeta}>
-          {(entry.size / 1024).toFixed(0)} KiB
-          {isHeic ? " · HEIC" : ""}
+      {showOverlay && (
+        <div className={styles.tileOverlay}>
+          <div className={styles.tileName}>{entry.filename}</div>
+          <div className={styles.tileMeta}>
+            {(entry.size / 1024).toFixed(0)} KiB
+            {isHeic ? " · HEIC" : ""}
+          </div>
         </div>
-      </div>
+      )}
       <button
         className={styles.checkBtn}
         data-selected={selected}
@@ -338,7 +352,7 @@ function Tile({ entry, thumbUrl, selected, loading, onTileClick, onCheckClick, o
       )}
     </div>
   );
-}
+});
 
 export default function Home() {
   const [passphrase, setPassphrase] = useState("");
@@ -440,11 +454,21 @@ export default function Home() {
       .catch(() => {});
   }, [unlocked]);
 
-  const allEntries = unlocked ? Object.values(unlocked.manifest.entries) : [];
-  const libraryEntries = allEntries.filter((e) => !e.deleted);
-  const trashEntries = allEntries.filter((e) => e.deleted);
-  const videoEntries = libraryEntries.filter(isVideoEntry);
-  const photoEntries = libraryEntries.filter((e) => !isVideoEntry(e));
+  // Everything derived from the manifest is memoized: with thousands of
+  // entries, re-filtering, re-sorting and re-grouping on every render (and
+  // a render happens for every thumbnail, selection or status change) was
+  // a large share of the main-thread time on phones.
+  const manifestEntries = unlocked?.manifest.entries;
+  const { libraryEntries, trashEntries, videoEntries, photoEntries } = useMemo(() => {
+    const all = manifestEntries ? Object.values(manifestEntries) : [];
+    const library = all.filter((e) => !e.deleted);
+    return {
+      libraryEntries: library,
+      trashEntries: all.filter((e) => e.deleted),
+      videoEntries: library.filter(isVideoEntry),
+      photoEntries: library.filter((e) => !isVideoEntry(e)),
+    };
+  }, [manifestEntries]);
   const baseEntries =
     view === "trash"
       ? trashEntries
@@ -454,37 +478,46 @@ export default function Home() {
       ? videoEntries
       : libraryEntries;
   const searchLower = search.trim().toLowerCase();
-  const visibleEntries = (searchLower
-    ? baseEntries.filter((e) => e.filename.toLowerCase().includes(searchLower))
-    : baseEntries
-  ).sort((a, b) => capturedOf(b) - capturedOf(a));
-
+  const visibleEntries = useMemo(
+    () =>
+      (searchLower
+        ? baseEntries.filter((e) => e.filename.toLowerCase().includes(searchLower))
+        : [...baseEntries]
+      ).sort((a, b) => capturedOf(b) - capturedOf(a)),
+    [baseEntries, searchLower]
+  );
 
   // Group visible entries by day, preserving desc-sorted order.
-  const dateGroups: { label: string; entries: ManifestEntry[] }[] = [];
-  for (const entry of visibleEntries) {
-    const label = dateGroupLabel(capturedOf(entry));
-    const last = dateGroups[dateGroups.length - 1];
-    if (last && last.label === label) last.entries.push(entry);
-    else dateGroups.push({ label, entries: [entry] });
-  }
+  const dateGroups = useMemo(() => {
+    const now = new Date();
+    const groups: { label: string; entries: ManifestEntry[] }[] = [];
+    for (const entry of visibleEntries) {
+      const label = dateGroupLabel(capturedOf(entry), now);
+      const last = groups[groups.length - 1];
+      if (last && last.label === label) last.entries.push(entry);
+      else groups.push({ label, entries: [entry] });
+    }
+    return groups;
+  }, [visibleEntries]);
 
   // Folders view: Year -> Month -> Day, computed from capture date.
-  const folderYears = new Map<number, Map<number, Map<number, ManifestEntry[]>>>();
-  if (view === "folders") {
+  const folderYears = useMemo(() => {
+    const years = new Map<number, Map<number, Map<number, ManifestEntry[]>>>();
+    if (view !== "folders") return years;
     for (const entry of libraryEntries) {
       const d = new Date(capturedOf(entry) * 1000);
       const y = d.getFullYear();
       const m = d.getMonth();
       const day = d.getDate();
-      if (!folderYears.has(y)) folderYears.set(y, new Map());
-      const months = folderYears.get(y)!;
+      if (!years.has(y)) years.set(y, new Map());
+      const months = years.get(y)!;
       if (!months.has(m)) months.set(m, new Map());
       const days = months.get(m)!;
       if (!days.has(day)) days.set(day, []);
       days.get(day)!.push(entry);
     }
-  }
+    return years;
+  }, [view, libraryEntries]);
   const folderYearsSorted = Array.from(folderYears.keys()).sort((a, b) => b - a);
   const folderMonths = folderPath.year !== undefined ? folderYears.get(folderPath.year) : undefined;
   const folderDays =
@@ -493,7 +526,7 @@ export default function Home() {
       : undefined;
   const folderDayEntries =
     folderPath.year !== undefined && folderPath.month !== undefined && folderPath.day !== undefined
-      ? (folderDays?.get(folderPath.day) ?? []).sort((a, b) => capturedOf(b) - capturedOf(a))
+      ? [...(folderDays?.get(folderPath.day) ?? [])].sort((a, b) => capturedOf(b) - capturedOf(a))
       : undefined;
   const MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
@@ -873,17 +906,45 @@ export default function Home() {
   const evictTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const EVICT_DELAY_MS = 4000;
 
+  // Thumbnail adds/evictions are queued and applied in one setThumbs per
+  // ~50ms instead of one render per thumbnail -- while scrolling, dozens
+  // land within a few frames of each other. A queued value of null means
+  // "evict".
+  const pendingThumbOps = useRef<Map<string, string | null>>(new Map());
+  const thumbFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function flushThumbOps() {
+    thumbFlushTimer.current = null;
+    const ops = pendingThumbOps.current;
+    if (ops.size === 0) return;
+    pendingThumbOps.current = new Map();
+    setThumbs((prev) => {
+      let next = prev;
+      for (const [id, url] of ops) {
+        if (url === null && !(id in next)) continue;
+        if (next === prev) next = { ...prev };
+        if (next[id]) URL.revokeObjectURL(next[id]);
+        if (url === null) delete next[id];
+        else next[id] = url;
+      }
+      return next;
+    });
+  }
+
+  function queueThumbOp(id: string, url: string | null) {
+    const queued = pendingThumbOps.current.get(id);
+    if (queued) URL.revokeObjectURL(queued); // superseded before it was ever shown
+    pendingThumbOps.current.set(id, url);
+    if (thumbFlushTimer.current === null) {
+      thumbFlushTimer.current = setTimeout(flushThumbOps, 50);
+    }
+  }
+
   function evictThumb(id: string) {
     evictTimers.current.delete(id);
     if (nearIds.current.has(id)) return; // came back near before the timer fired
     thumbsRequested.current.delete(id);
-    setThumbs((prev) => {
-      if (!(id in prev)) return prev;
-      URL.revokeObjectURL(prev[id]);
-      const next = { ...prev };
-      delete next[id];
-      return next;
-    });
+    queueThumbOp(id, null);
   }
 
   function handleTileNear(entry: ManifestEntry, near: boolean, el: Element) {
@@ -909,19 +970,19 @@ export default function Home() {
   // Flush any pending eviction timers on unmount so they don't fire (and
   // revoke URLs) after the component is gone.
   useEffect(() => {
+    const timers = evictTimers.current;
     return () => {
-      for (const timer of evictTimers.current.values()) clearTimeout(timer);
-      evictTimers.current.clear();
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+      if (thumbFlushTimer.current !== null) clearTimeout(thumbFlushTimer.current);
     };
   }, []);
 
-  function showThumb(id: string, blob: Blob) {
+  function showThumb(id: string, blob: Blob, fromCache = false) {
     thumbsRequested.current.add(id);
-    setThumbs((prev) => {
-      if (prev[id]) URL.revokeObjectURL(prev[id]);
-      return { ...prev, [id]: URL.createObjectURL(blob) };
-    });
-    void putCachedThumb(id, blob);
+    queueThumbOp(id, URL.createObjectURL(blob));
+    // Re-writing a blob we just read from IndexedDB is wasted I/O.
+    if (!fromCache) void putCachedThumb(id, blob);
   }
 
   async function generateThumb(entry: ManifestEntry, fileKey: Uint8Array): Promise<Blob | null> {
@@ -969,7 +1030,7 @@ export default function Home() {
       const cached = await getCachedThumb(id);
       if (cached) {
         settled = true;
-        showThumb(id, cached);
+        showThumb(id, cached, true);
         return;
       }
 
@@ -1331,6 +1392,25 @@ export default function Home() {
     if (dx > SWIPE_THRESHOLD) openByOffset(-1);
     else if (dx < -SWIPE_THRESHOLD) openByOffset(1);
   }
+
+  // Referentially stable tile callbacks (so memo(Tile) can skip re-renders)
+  // that always call the latest closure.
+  const tileHandlers = useRef({ handleTileClick, handleCheckClick, handleTileNear });
+  useEffect(() => {
+    tileHandlers.current = { handleTileClick, handleCheckClick, handleTileNear };
+  });
+  const onTileClick = useCallback(
+    (entry: ManifestEntry, e: React.MouseEvent) => tileHandlers.current.handleTileClick(entry, e),
+    []
+  );
+  const onCheckClick = useCallback(
+    (entry: ManifestEntry, e: React.MouseEvent) => tileHandlers.current.handleCheckClick(entry, e),
+    []
+  );
+  const onNearChange = useCallback(
+    (entry: ManifestEntry, near: boolean, el: Element) => tileHandlers.current.handleTileNear(entry, near, el),
+    []
+  );
 
   function zoomBy(dir: 1 | -1) {
     if (isMobile) {
@@ -1832,9 +1912,10 @@ export default function Home() {
                         thumbUrl={thumbs[entry.file_id_hex]}
                         selected={!!selectedIds[entry.file_id_hex]}
                         loading={loadingIds.has(entry.file_id_hex)}
-                        onTileClick={handleTileClick}
-                        onCheckClick={handleCheckClick}
-                        onNearChange={handleTileNear}
+                        onTileClick={onTileClick}
+                        onCheckClick={onCheckClick}
+                        onNearChange={onNearChange}
+                        showOverlay={!isMobile}
                       />
                     ))}
                   </div>
@@ -1878,9 +1959,10 @@ export default function Home() {
                         thumbUrl={thumbs[entry.file_id_hex]}
                         selected={!!selectedIds[entry.file_id_hex]}
                         loading={loadingIds.has(entry.file_id_hex)}
-                        onTileClick={handleTileClick}
-                        onCheckClick={handleCheckClick}
-                        onNearChange={handleTileNear}
+                        onTileClick={onTileClick}
+                        onCheckClick={onCheckClick}
+                        onNearChange={onNearChange}
+                        showOverlay={!isMobile}
                       />
                     ))}
                     </div>
